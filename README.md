@@ -1,4 +1,4 @@
-# BemNG.tech_RL_Fun
+# BeamNG.tech_RL_Fun
 
 Reinforcement learning experiments by **Mikey Dempsey, age 9**, working toward
 training a self-driving car in [BeamNG.tech](https://beamng.tech/).
