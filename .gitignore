@@ -1,0 +1,29 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Secrets / keys
+tech.key
+*.key
+.env
+.env.*
+
+# Archives
+*.zip
+
+# Trained models
+*.pt
+*.pth
+
+# Training output
+logs/
+runs/
+
+# Recordings
+recordings/
+*.mp4
+
+# OS junk
+.DS_Store
+Thumbs.db
