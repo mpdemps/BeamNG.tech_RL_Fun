@@ -72,5 +72,5 @@ Yosh trains a deep-RL agent (DQN) to drive Trackmania by feeding the network a s
 ### PedroAI — Trackmania RL
 
 - **URL:** <!-- TODO Mike: URL -->
-- **Relevance to our project:** Another YouTuber doing Trackmania RL, with a different methodology (more focus on vision-based learning). Useful as a counterpoint to Yosh's engineered-input approach.
-- **Watch out for:** Vision-based learning is roughly an order of magnitude more compute than engineered inputs. We're explicitly not going down that road in Phase 1, so treat PedroAI as "could we try this in the future" inspiration, not as a template for what we build now.
+- **Relevance to our project:** Another YouTuber doing Trackmania RL — useful as a second data point and counterpoint to Yosh's approach. PedroAI uses DQN with a multi-worker setup (per the project's own writeup); the input representation, exact reward, and network details aren't verified yet — fill in once we've watched a video or two.
+- **Watch out for:** Nothing specific to flag until the methodology above is verified.
