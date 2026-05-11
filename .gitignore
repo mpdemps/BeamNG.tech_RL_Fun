@@ -27,3 +27,6 @@ recordings/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Local notes (intentionally not committed)
+notes/
