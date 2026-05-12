@@ -3,11 +3,14 @@ Record the centerline of West Coast USA's racetrack by polling the
 vehicle's position while Mike drives a lap manually.
 
 Plain-language overview, Mikey:
-- Dad drives the car around the racetrack once, normally.
-- This script writes down where the car is every half-second.
+- The script opens BeamNG by itself, loads West Coast USA, and puts the
+  ETK 800 on the racetrack.
+- Dad takes the wheel and drives the racetrack once, normally.
+- The script waits until the car starts moving, then writes down where
+  the car is every half-second.
 - It cleans up the list (drops duplicate points from when the car was
-  stopped or barely moving).
-- It saves the cleaned racing line to data/centerline_racetrack.py.
+  stopped or barely moving) and saves the cleaned racing line to
+  data/centerline_racetrack.py.
 - The training script reads that file the next time we train, so the AI
   knows the shape of the track.
 
@@ -16,11 +19,8 @@ Future training (this machine or any other) reuses the file — no need to
 re-record unless we switch tracks.
 
 Usage:
-    1. Start BeamNG.tech, load West Coast USA, spawn the ETK 800 on the
-       racetrack starting line.
-    2. From the repo root: python scripts/record_centerline.py
-    3. Follow the on-screen instructions, then drive a lap.
-    4. Press Enter when you cross the finish line.
+    From the repo root: python scripts/record_centerline.py
+    Then drive a lap and press Enter (in this terminal) when done.
 """
 
 import argparse
@@ -31,12 +31,25 @@ import threading
 from datetime import date
 from pathlib import Path
 
-from beamngpy import BeamNGpy
+from beamngpy import BeamNGpy, Scenario, Vehicle
 from beamngpy.sensors import State
 
 
-POLL_INTERVAL_S = 0.5
+# ---- Tunable constants ----
+MAP_NAME = "west_coast_usa"
+VEHICLE_MODEL = "etk800"
+VEHICLE_ID = "ego"
+# WCUSA racetrack start/finish line pose, recorded by Mike on 2026-05-12.
+# Yaw is roughly 88.6°, rotated 180° from the previous attempt (which faced
+# the wrong way down the straight).
+SPAWN_POS = (394.70, -252.02, 145.16)
+SPAWN_QUAT = (0.0, 0.0, 0.698, 0.716)
+
+POLL_INTERVAL_FAST_S = 0.1     # motion-detection polling cadence
+POLL_INTERVAL_RECORD_S = 0.5   # position-recording cadence once moving
+MOTION_THRESHOLD_M_S = 2.0     # car must exceed this speed to start recording
 DEDUPE_MIN_DIST_M = 1.0
+
 DEFAULT_HOME = r"C:\BeamNG\BeamNG.tech.v0.38.5.0"
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 25252
@@ -52,52 +65,59 @@ def parse_args():
     return p.parse_args()
 
 
-def get_vehicles_dict(bng):
-    """Return {vid: Vehicle} across BeamNGpy API versions."""
-    if hasattr(bng, "vehicles") and hasattr(bng.vehicles, "get_current"):
-        return bng.vehicles.get_current()
-    # Older BeamNGpy fallback.
-    return bng.get_current_vehicles()
+def setup_scenario(bng) -> Vehicle:
+    """Build the West Coast USA racetrack scenario and start it. Return vehicle."""
+    scenario = Scenario(MAP_NAME, "phase1_lap_recording")
+    vehicle = Vehicle(VEHICLE_ID, model=VEHICLE_MODEL)
+    # Attach our State sensor under "agent_state" — matches the convention
+    # in envs/beamng_env.py and avoids collision with BeamNG's default
+    # "state" sensor.
+    vehicle.sensors.attach("agent_state", State())
+    scenario.add_vehicle(vehicle, pos=SPAWN_POS, rot_quat=SPAWN_QUAT)
+    scenario.make(bng)
+    bng.scenario.load(scenario)
+    bng.scenario.start()
+    # Intentionally do NOT call set_deterministic — Mike needs BeamNG to
+    # run in normal real-time mode so he can drive with the wheel/keyboard.
+    return vehicle
 
 
-def pick_vehicle(bng):
-    """Return the player's vehicle from the running BeamNG instance."""
-    vehicles = get_vehicles_dict(bng)
-    if not vehicles:
-        raise RuntimeError(
-            "No vehicles found in BeamNG. Spawn the ETK 800 on the "
-            "racetrack first, then re-run this script."
-        )
-    if len(vehicles) == 1:
-        return next(iter(vehicles.values()))
-    # Multiple vehicles — prefer an explicit player getter if the BeamNGpy
-    # version exposes one, otherwise take the first and warn.
-    for attr in ("get_player_vehicle", "get_active"):
+def record_loop(vehicle, points, complete_event):
+    """Wait for first motion, then record positions until complete_event fires.
+
+    Two phases:
+      1. Motion detection at POLL_INTERVAL_FAST_S — poll speed, wait for it
+         to exceed MOTION_THRESHOLD_M_S. Don't record anything yet.
+      2. Position recording at POLL_INTERVAL_RECORD_S — append (x, y, z) to
+         points each tick.
+
+    Both phases exit cleanly the moment complete_event is set (Enter pressed
+    in the main thread).
+    """
+    # Phase 1: motion detection.
+    while not complete_event.is_set():
         try:
-            v = getattr(bng.vehicles, attr)()
-            if v is not None:
-                return v
-        except Exception:
-            continue
-    v = next(iter(vehicles.values()))
-    print(f"WARNING: multiple vehicles found ({list(vehicles.keys())}); "
-          f"using '{v.vid}'. Despawn the others if this is wrong.",
-          file=sys.stderr)
-    return v
+            vehicle.sensors.poll()
+            vel = vehicle.sensors["agent_state"]["vel"]
+            speed = math.sqrt(vel[0] ** 2 + vel[1] ** 2 + vel[2] ** 2)
+            if speed > MOTION_THRESHOLD_M_S:
+                print("Recording started!", flush=True)
+                break
+        except Exception as e:
+            print(f"Poll error (continuing): {e}", file=sys.stderr)
+        if complete_event.wait(POLL_INTERVAL_FAST_S):
+            return  # Enter pressed before the car moved — nothing to record.
 
-
-def poll_loop(vehicle, points, interval, stop_event):
-    """Background polling: appends (x, y, z) until stop_event fires."""
-    while not stop_event.is_set():
+    # Phase 2: position recording.
+    while not complete_event.is_set():
         try:
             vehicle.sensors.poll()
             pos = vehicle.sensors["agent_state"]["pos"]
             points.append((float(pos[0]), float(pos[1]), float(pos[2])))
         except Exception as e:
             print(f"Poll error (continuing): {e}", file=sys.stderr)
-        # Sleep, but wake immediately if stop_event is set during the wait.
-        if stop_event.wait(interval):
-            break
+        if complete_event.wait(POLL_INTERVAL_RECORD_S):
+            return
 
 
 def dedupe(points, min_dist):
@@ -146,45 +166,42 @@ def write_centerline(path: Path, points, length_m: float):
 def main():
     args = parse_args()
 
-    print("Connecting to BeamNG (must already be running)...")
+    print("Launching BeamNG (West Coast USA, ETK 800)...")
     bng = BeamNGpy(args.host, args.port, home=args.home)
-    bng.open(launch=False)
+    bng.open(launch=True)
 
-    vehicle = pick_vehicle(bng)
-    print(f"Using vehicle: {vehicle.vid}")
-
-    # Attach our State sensor under "agent_state" — matches the convention
-    # in envs/beamng_env.py and avoids collision with BeamNG's default
-    # "state" sensor.
-    vehicle.sensors.attach("agent_state", State())
+    vehicle = setup_scenario(bng)
 
     print()
     print("=" * 64)
-    print("Drive a full lap of the racetrack at moderate speed (40-60 mph).")
+    print("BeamNG is ready.")
+    print("Take the wheel and drive a clean lap of the racetrack.")
     print("Stay in the middle of the lane.")
-    print("Press Enter when finished.")
+    print("Recording will start automatically when the car begins moving.")
+    print("Press Enter (in this terminal) when the lap is complete.")
     print("=" * 64)
     print()
 
     points: list[tuple[float, float, float]] = []
-    stop_event = threading.Event()
-    poller = threading.Thread(
-        target=poll_loop,
-        args=(vehicle, points, POLL_INTERVAL_S, stop_event),
+    complete_event = threading.Event()
+    recorder = threading.Thread(
+        target=record_loop,
+        args=(vehicle, points, complete_event),
         daemon=True,
     )
-    poller.start()
+    recorder.start()
 
     try:
         input()
     except KeyboardInterrupt:
         print("\nInterrupted — saving what we have so far.")
     finally:
-        stop_event.set()
-        poller.join(timeout=2.0)
+        complete_event.set()
+        recorder.join(timeout=2.0)
 
     if not points:
-        print("No points recorded. Aborting (did the vehicle move?).",
+        print("No points recorded. Did the car move? "
+              f"(motion threshold is {MOTION_THRESHOLD_M_S} m/s)",
               file=sys.stderr)
         sys.exit(1)
 
