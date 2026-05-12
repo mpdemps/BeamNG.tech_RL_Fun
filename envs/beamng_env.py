@@ -15,6 +15,7 @@ step().
 """
 
 import math
+import sys
 from typing import Optional, Tuple
 
 import gymnasium
@@ -47,23 +48,32 @@ DEFAULT_PORT = 25252
 
 
 # ---- Centerline checkpoints ----
-# TODO(Mike+Mikey): replace with real centerline points from West Coast USA's
-# racetrack. We'll record them with a one-off "drive-and-log" script after
-# this env builds and connects. For now these are placeholder coords near the
-# default racetrack starting straight so the env can at least load and we can
-# verify the BeamNGpy connection end-to-end.
-CENTERLINE: list[tuple[float, float, float]] = [
-    (-717.0, 101.0, 118.0),
-    (-707.0, 101.0, 118.0),
-    (-697.0, 101.0, 118.0),
-    (-687.0, 101.0, 118.0),
-    (-677.0, 101.0, 118.0),
-    (-667.0, 101.0, 118.0),
-    (-657.0, 101.0, 118.0),
-    (-647.0, 101.0, 118.0),
-    (-637.0, 101.0, 118.0),
-    (-627.0, 101.0, 118.0),
-]
+# The real centerline lives in data/centerline_racetrack.py, recorded once
+# by scripts/record_centerline.py while Mike drives a lap manually. If
+# that file doesn't exist (fresh clone before recording), we fall back to a
+# rough placeholder so the env still imports — but the car will spawn in
+# walls or in midair. Run scripts/record_centerline.py to fix.
+try:
+    from data.centerline_racetrack import CENTERLINE
+except ImportError:
+    print(
+        "WARNING: data/centerline_racetrack.py not found — using placeholder "
+        "centerline. The car will spawn in walls or midair. Run "
+        "scripts/record_centerline.py to record the real racing line.",
+        file=sys.stderr,
+    )
+    CENTERLINE = [
+        (-717.0, 101.0, 118.0),
+        (-707.0, 101.0, 118.0),
+        (-697.0, 101.0, 118.0),
+        (-687.0, 101.0, 118.0),
+        (-677.0, 101.0, 118.0),
+        (-667.0, 101.0, 118.0),
+        (-657.0, 101.0, 118.0),
+        (-647.0, 101.0, 118.0),
+        (-637.0, 101.0, 118.0),
+        (-627.0, 101.0, 118.0),
+    ]
 
 
 # One BeamNG connection shared by both the training env and the eval env.
