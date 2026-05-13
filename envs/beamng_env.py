@@ -15,7 +15,6 @@ step().
 """
 
 import math
-import sys
 from typing import Optional, Tuple
 
 import gymnasium
@@ -37,43 +36,41 @@ MAX_LOOKAHEAD_DIST_M = 200.0
 CENTER_OFFSET_CLIP_M = 10.0
 OFF_TRACK_THRESHOLD_M = 20.0        # generous; tighten once centerline is real
 STUCK_STEPS_THRESHOLD = 200
+STOPPED_SPEED_M_S = 0.5             # below this, treat the car as stationary
+                                    # for alignment purposes (no backward penalty)
 FLIP_PENALTY = -10.0
 OFF_TRACK_PENALTY = -10.0
 STUCK_PENALTY = -5.0
 LAP_BONUS = 50.0
-RANDOM_HEADING_DEG = 30.0
+RANDOM_HEADING_DEG = 0.0            # intentionally 0 for early training:
+                                    # deterministic spawn along the tangent
+                                    # gives a sharper learning signal. Widen
+                                    # to 5-10° once the policy has a baseline.
+# Built-in centerline Z values are road-surface elevation. The ETK 800's
+# spawn position needs to be vehicle center-of-mass elevation, ~0.5 m above
+# the road; spawning at road Z makes wheels penetrate terrain, which the
+# physics engine resolves by shoving the car sideways — which then *looks*
+# like a yaw bug. Adding a small vertical offset drops the car onto the road
+# cleanly. Better to fall a few cm than to clip into terrain.
+SPAWN_Z_OFFSET_M = 1.0
+# Reserved for future use if a systematic bias is identified between the
+# computed centerline tangent and the visual road direction. Currently 0
+# (no-op); applied inside _smoothed_forward_yaw so a single value change
+# adjusts both the spawn orientation and the alignment-gate's tangent.
+SPAWN_YAW_BIAS_DEG = 0.0
 RANDOM_SPEED_MAX_M_S = 30.0
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 25252
 
 
 # ---- Centerline checkpoints ----
-# The real centerline lives in data/centerline_racetrack.py, recorded once
-# by scripts/record_centerline.py while Mike drives a lap manually. If
-# that file doesn't exist (fresh clone before recording), we fall back to a
-# rough placeholder so the env still imports — but the car will spawn in
-# walls or in midair. Run scripts/record_centerline.py to fix.
-try:
-    from data.centerline_racetrack import CENTERLINE
-except ImportError:
-    print(
-        "WARNING: data/centerline_racetrack.py not found — using placeholder "
-        "centerline. The car will spawn in walls or midair. Run "
-        "scripts/record_centerline.py to record the real racing line.",
-        file=sys.stderr,
-    )
-    CENTERLINE = [
-        (-717.0, 101.0, 118.0),
-        (-707.0, 101.0, 118.0),
-        (-697.0, 101.0, 118.0),
-        (-687.0, 101.0, 118.0),
-        (-677.0, 101.0, 118.0),
-        (-667.0, 101.0, 118.0),
-        (-657.0, 101.0, 118.0),
-        (-647.0, 101.0, 118.0),
-        (-637.0, 101.0, 118.0),
-        (-627.0, 101.0, 118.0),
-    ]
+# The centerline comes from BeamNG's built-in DecalRoad geometry, extracted
+# once by scripts/extract_centerline.py — the authoritative game data, no
+# recording wobble or unclosed-loop artifacts. The old manual-recording
+# import is kept here, commented, as a fallback reference: switch back if
+# the built-in data ever proves wrong.
+# from data.centerline_racetrack import CENTERLINE  # original manual recording
+from data.centerline_racetrack_builtin import CENTERLINE
 
 
 # One BeamNG connection shared by both the training env and the eval env.
@@ -110,7 +107,9 @@ def _connect(home: Optional[str], host: str, port: int, launch: bool,
     vehicle.sensors.attach("agent_state", State())
     vehicle.sensors.attach("electrics", Electrics())
     vehicle.sensors.attach("damage", Damage())
-    scenario.add_vehicle(vehicle, pos=CENTERLINE[0], rot_quat=(0, 0, 0, 1))
+    initial_pos = (CENTERLINE[0][0], CENTERLINE[0][1],
+                   CENTERLINE[0][2] + SPAWN_Z_OFFSET_M)
+    scenario.add_vehicle(vehicle, pos=initial_pos, rot_quat=(0, 0, 0, 1))
     scenario.make(bng)
 
     bng.scenario.load(scenario)
@@ -162,6 +161,11 @@ class BeamNGRaceEnv(gymnasium.Env):
 
         self._last_centerline_dist = 0.0
         self._steps_since_progress = 0
+        # Diagnostic fields surfaced via step()'s info dict. Initialized so
+        # the first step's info has sane defaults before _compute_reward runs.
+        self._last_raw_progress = 0.0
+        self._last_raw_alignment = 1.0   # signed; 1.0 = "no data yet"
+        self._last_final_reward = 0.0
 
     def reset(self, seed=None, options=None):
         """Put the car at a spawn point and hand back the first observation."""
@@ -179,8 +183,62 @@ class BeamNGRaceEnv(gymnasium.Env):
             heading_offset = 0.0
             start_speed = 0.0
 
-        self._teleport_to(idx, heading_offset, start_speed)
+        forward_yaw = self._smoothed_forward_yaw(idx)
+        final_yaw = forward_yaw + heading_offset
+        sent_quat = _yaw_to_quat(final_yaw)
+
+        # Hand-recompute the tangent so the print shows raw inputs (lets us
+        # spot a unit-conversion or coordinate-frame mistake in the helper).
+        prev_pt = CENTERLINE[(idx - 1) % len(CENTERLINE)]
+        curr_pt = CENTERLINE[idx]
+        next_pt = CENTERLINE[(idx + 1) % len(CENTERLINE)]
+        hand_dx = next_pt[0] - prev_pt[0]
+        hand_dy = next_pt[1] - prev_pt[1]
+        hand_atan2 = math.atan2(hand_dy, hand_dx)
+
+        self._teleport_to(idx, sent_quat, start_speed)
         _shared["vehicle"].sensors.poll()
+
+        # Round-trip diagnostic: compare the quat we sent to the one BeamNG
+        # reports back. If they're nearly equal, the orientation pipeline is
+        # clean and any apparent "spawn direction wrong" issue lives elsewhere
+        # (centerline geometry, vehicle visual model, or sensor semantics).
+        # If they differ, the math/protocol is the actual problem.
+        read_quat = _shared["vehicle"].sensors["agent_state"].get(
+            "rotation", (0.0, 0.0, 0.0, 1.0))
+        measured_yaw = _quat_to_yaw(read_quat)
+        delta = (measured_yaw - final_yaw + math.pi) % (2 * math.pi) - math.pi
+
+        # Forward-vector diagnostic: rotate world +X by the read quat. If
+        # we asked for yaw=A°, this vector should be (cos A°, sin A°, ~0).
+        # A discrepancy means BeamNG's local-forward axis isn't +X.
+        forward_vec = _quat_rotate_x(read_quat)
+        vec_yaw = math.atan2(forward_vec[1], forward_vec[0])
+
+        print(
+            f"[reset] spawn idx={idx}, "
+            f"intended yaw={math.degrees(final_yaw):+.1f}°, "
+            f"sent quat=({sent_quat[0]:+.3f}, {sent_quat[1]:+.3f}, "
+            f"{sent_quat[2]:+.3f}, {sent_quat[3]:+.3f}), "
+            f"read quat=({read_quat[0]:+.3f}, {read_quat[1]:+.3f}, "
+            f"{read_quat[2]:+.3f}, {read_quat[3]:+.3f}), "
+            f"measured yaw={math.degrees(measured_yaw):+.1f}°, "
+            f"delta={math.degrees(delta):+.1f}°\n"
+            f"[reset]   hand tangent: "
+            f"prev=({prev_pt[0]:.2f}, {prev_pt[1]:.2f}, {prev_pt[2]:.2f}) "
+            f"curr=({curr_pt[0]:.2f}, {curr_pt[1]:.2f}, {curr_pt[2]:.2f}) "
+            f"next=({next_pt[0]:.2f}, {next_pt[1]:.2f}, {next_pt[2]:.2f}), "
+            f"dx={hand_dx:+.3f} dy={hand_dy:+.3f}, "
+            f"atan2={math.degrees(hand_atan2):+.2f}° "
+            f"(should match intended)\n"
+            f"[reset]   forward(+X·read_quat)="
+            f"({forward_vec[0]:+.4f}, {forward_vec[1]:+.4f}, "
+            f"{forward_vec[2]:+.4f}), "
+            f"atan2(fy,fx)={math.degrees(vec_yaw):+.2f}° "
+            f"(should match measured)",
+            flush=True,
+        )
+
         self._last_centerline_dist = self._distance_along_centerline()
         self._steps_since_progress = 0
         return self._get_observation(), {}
@@ -209,7 +267,16 @@ class BeamNGRaceEnv(gymnasium.Env):
         reward = self._compute_reward()
         terminated, term_bonus = self._check_done()
         truncated = False
-        return obs, reward + term_bonus, terminated, truncated, {}
+        # Diagnostics: raw_progress is the unsigned centerline-distance
+        # delta this tick; alignment is the SIGNED dot product (-1..+1, not
+        # clamped) so reverse driving shows as negative; final_reward is
+        # the post-gate reward BEFORE the terminal bonus is added.
+        info = {
+            "raw_progress": float(self._last_raw_progress),
+            "alignment": float(self._last_raw_alignment),
+            "final_reward": float(self._last_final_reward),
+        }
+        return obs, reward + term_bonus, terminated, truncated, info
 
     def close(self):
         """Leave the shared BeamNG connection open — other envs may still need it."""
@@ -220,12 +287,10 @@ class BeamNGRaceEnv(gymnasium.Env):
 
     # ---- Helpers ----
 
-    def _teleport_to(self, idx: int, heading_offset_rad: float, speed: float):
-        """Move the car onto a centerline point, facing roughly forward."""
-        pos = CENTERLINE[idx]
-        nxt = CENTERLINE[(idx + 1) % len(CENTERLINE)]
-        yaw = math.atan2(nxt[1] - pos[1], nxt[0] - pos[0]) + heading_offset_rad
-        quat = _yaw_to_quat(yaw)
+    def _teleport_to(self, idx: int, quat: tuple, speed: float):
+        """Move the car onto a centerline point with the given orientation quat."""
+        cx, cy, cz = CENTERLINE[idx]
+        pos = (cx, cy, cz + SPAWN_Z_OFFSET_M)
         v = _shared["vehicle"]
         v.teleport(pos, rot_quat=quat, reset=True)
         if speed > 0:
@@ -235,6 +300,23 @@ class BeamNGRaceEnv(gymnasium.Env):
                 # set_velocity is best-effort; if BeamNGpy version doesn't
                 # support it on a non-shifted vehicle, we just start at rest.
                 pass
+
+    def _smoothed_forward_yaw(self, idx: int) -> float:
+        """Local tangent yaw at idx: direction from CENTERLINE[idx-1] to [idx+1].
+
+        Using a forward chord (idx → idx+N) cuts across curves on a curved
+        section, pointing the car off the road. The local tangent (prev →
+        next) follows the track's actual direction at each point. Wraps
+        around the closed loop at both ends.
+
+        SPAWN_YAW_BIAS_DEG is added to the raw atan2 — defaults to 0°
+        (no-op); reserved as a single tuning knob in case a systematic
+        tangent-vs-visual bias is identified later.
+        """
+        prev_pt = CENTERLINE[(idx - 1) % len(CENTERLINE)]
+        next_pt = CENTERLINE[(idx + 1) % len(CENTERLINE)]
+        raw = math.atan2(next_pt[1] - prev_pt[1], next_pt[0] - prev_pt[0])
+        return raw + math.radians(SPAWN_YAW_BIAS_DEG)
 
     def _get_observation(self) -> np.ndarray:
         """Pack the 9 numbers the AI sees this tick."""
@@ -267,15 +349,52 @@ class BeamNGRaceEnv(gymnasium.Env):
         return np.clip(obs, -1.0, 1.0)
 
     def _compute_reward(self) -> float:
-        """The whole reward: distance moved along the racing line since last step."""
+        """Progress along the racing line, gated by whether the car faces forward.
+
+        Raw progress is just centerline distance moved since last step. That
+        accidentally rewards driving *backward* along the line, since the
+        position projects onto the same arc. We multiply by an alignment
+        factor — dot product of the car's horizontal velocity with the local
+        smoothed forward direction — so:
+          - moving forward at speed   -> alignment ~ 1.0, full reward
+          - drifting/sliding sideways -> alignment < 1.0, reduced reward
+          - moving backward           -> alignment <= 0, zero reward (clamped)
+          - nearly stopped            -> alignment forced to 1.0 so a spun-out
+                                         car isn't punished while recovering.
+        """
         d = self._distance_along_centerline()
-        progress = d - self._last_centerline_dist
+        raw_progress = d - self._last_centerline_dist
         self._last_centerline_dist = d
-        if progress > 0.01:
+
+        s = _shared["vehicle"].sensors["agent_state"]
+        vel = s["vel"]
+        pos = s["pos"]
+        speed_horizontal = math.sqrt(vel[0] ** 2 + vel[1] ** 2)
+
+        if speed_horizontal < STOPPED_SPEED_M_S:
+            # No directional signal when essentially stopped — pin alignment
+            # at 1.0 so a spun-out car can recover without losing reward.
+            raw_alignment = 1.0
+        else:
+            idx = self._closest_checkpoint_idx(pos)
+            forward_yaw = self._smoothed_forward_yaw(idx)
+            fx, fy = math.cos(forward_yaw), math.sin(forward_yaw)
+            vx, vy = vel[0] / speed_horizontal, vel[1] / speed_horizontal
+            raw_alignment = vx * fx + vy * fy   # signed, -1 to +1
+
+        # Gate: clamp negative to zero so backward driving earns no reward.
+        gated_alignment = max(0.0, raw_alignment)
+        final_reward = raw_progress * gated_alignment
+
+        self._last_raw_progress = raw_progress
+        self._last_raw_alignment = raw_alignment
+        self._last_final_reward = final_reward
+
+        if final_reward > 0.01:
             self._steps_since_progress = 0
         else:
             self._steps_since_progress += 1
-        return float(progress)
+        return float(final_reward)
 
     def _check_done(self) -> Tuple[bool, float]:
         """Did the episode end? If so, what bonus or penalty applies?"""
@@ -359,9 +478,41 @@ def _project_along(pos, a, b) -> float:
 
 
 def _yaw_to_quat(yaw: float):
-    """Rotation quaternion (x, y, z, w) from a yaw angle in radians."""
+    """Rotation quaternion (x, y, z, w) for a pure yaw rotation, in radians.
+
+    Matches BeamNGpy's own `angle_to_quat([0, 0, yaw_deg])` for the
+    yaw-only case — same standard math convention, no sign flip.
+    """
     half = yaw / 2.0
     return (0.0, 0.0, math.sin(half), math.cos(half))
+
+
+def _quat_to_yaw(quat) -> float:
+    """Extract yaw (rotation about +Z) from a quaternion in (x, y, z, w) order.
+
+    Standard ZYX-intrinsic Tait-Bryan decomposition. For a pure-yaw quat
+    (0, 0, sin(θ/2), cos(θ/2)) this returns θ exactly; for a quat with
+    pitch/roll mixed in, it returns the yaw component of that decomposition.
+    """
+    x, y, z, w = quat[0], quat[1], quat[2], quat[3]
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def _quat_rotate_x(quat) -> tuple:
+    """Apply rotation `quat` (x, y, z, w) to the world +X axis.
+
+    Returns (fx, fy, fz) — the actual forward vector the rotation produces
+    on a unit-+X starting direction. Bypasses yaw-extraction shortcuts;
+    useful for checking whether BeamNG interprets our quat differently
+    than our atan2-based yaw extraction would suggest.
+    """
+    x, y, z, w = quat[0], quat[1], quat[2], quat[3]
+    fx = 1.0 - 2.0 * (y * y + z * z)
+    fy = 2.0 * (x * y + z * w)
+    fz = 2.0 * (x * z - y * w)
+    return (fx, fy, fz)
 
 
 # ---- Factory: kept for symmetry with the old API, now a trivial wrapper ----

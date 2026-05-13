@@ -2,19 +2,24 @@
 Train a PPO agent to drive a lap on West Coast USA in BeamNG.tech.
 
 Plain-language overview, Mikey:
-- Spawn the car in BeamNG (which is already running) and let it try to drive.
-- Use the stable-baselines3 PPO algorithm to learn from trial and error.
-- Save the best version of the car-brain automatically — not just the last one.
-- Log everything so we can stare at training curves in TensorBoard.
-- After training, write a row in RUNS.md so future-us remembers what we tried.
+- The script opens BeamNG by itself, then puts the car in it.
+- The car tries to drive; the stable-baselines3 PPO algorithm learns from
+  trial and error.
+- The best version of the car-brain gets saved automatically — not just
+  the last one.
+- Everything is logged so we can stare at training curves in TensorBoard.
+- After training, a row is written in RUNS.md so future-us remembers what
+  we tried.
 
-By default this attaches to a BeamNG instance you've already started, so
-Mikey can watch the car learn live. Pass --launch to start a fresh one.
+By default this launches a fresh BeamNG instance — a manually-launched
+BeamNG.tech.exe doesn't open the TechCom port for Python, so attaching to
+an existing instance (--no-launch) is rarely useful and exists only for
+debugging.
 
 Troubleshooting:
 - If a previous run crashed partway through, a BeamNG.tech.exe process may
-  still be lingering. Kill it from Task Manager before re-running with
-  --launch, otherwise the new launch will fight the zombie one for the
+  still be lingering. Kill it from Task Manager before re-running,
+  otherwise the new BeamNG launch will fight the zombie one for the
   BeamNGpy port and hang.
 """
 
@@ -46,9 +51,12 @@ def parse_args():
                    help="BeamNG.tech install directory.")
     p.add_argument("--host", default="localhost")
     p.add_argument("--port", type=int, default=25252)
-    p.add_argument("--launch", action="store_true",
-                   help="Launch a new BeamNG instance instead of attaching "
-                        "to one already running.")
+    p.add_argument("--no-launch", dest="launch", action="store_false",
+                   help="Attach to an already-running BeamNG instead of "
+                        "launching a new one. Rare — manually-launched "
+                        "BeamNG doesn't open the TechCom port for Python, "
+                        "so this is only useful for special debugging.")
+    p.set_defaults(launch=True)
     p.add_argument("--headless", action="store_true",
                    help="Hide the BeamNG window (faster, no watching).")
     p.add_argument("--no-journal", action="store_true",
@@ -68,10 +76,32 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    train_env = Monitor(make_beamng_env(
-        random_spawn=True, home=args.home, host=args.host, port=args.port,
-        launch=args.launch, headless=args.headless,
-    ))
+    # Startup banner — gives the user something to look at while BeamNG
+    # silently loads (which can take 30-60 seconds).
+    print("=" * 64)
+    print(f"Run name:         {run_name}")
+    print(f"Timesteps:        {args.timesteps:,}")
+    print(f"Mode:             {'headless' if args.headless else 'headed (windowed)'}")
+    print(f"BeamNG home:      {args.home}")
+    print(f"BeamNG launch:    "
+          f"{'NEW (launching fresh)' if args.launch else 'NO (attaching to existing)'}")
+    print(f"TensorBoard log:  {log_dir}")
+    print("=" * 64)
+    print("Loading BeamNG (this can take 30-60 seconds — silent until done)...")
+    print(flush=True)
+
+    # Monitor logs ep-end values of the listed info-dict keys to a CSV
+    # alongside the standard r/l/t columns. NOTE: this is per-EPISODE-END,
+    # not per-step — for true per-step CSV we'd need a custom callback.
+    monitor_info_keys = ("raw_progress", "alignment", "final_reward")
+    train_env = Monitor(
+        make_beamng_env(
+            random_spawn=True, home=args.home, host=args.host, port=args.port,
+            launch=args.launch, headless=args.headless,
+        ),
+        filename=str(log_dir / "train"),
+        info_keywords=monitor_info_keys,
+    )
     # Eval env shares the same BeamNG connection (singleton in beamng_env.py)
     # and never runs at the same time as training, so launch=False here
     # always — we don't want a second BeamNG window.
