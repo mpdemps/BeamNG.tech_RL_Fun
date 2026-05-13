@@ -59,6 +59,12 @@ def parse_args():
     p.set_defaults(launch=True)
     p.add_argument("--headless", action="store_true",
                    help="Hide the BeamNG window (faster, no watching).")
+    p.add_argument("--nogpu", action="store_true",
+                   help="Skip the BeamNG rendering pipeline entirely "
+                        "(implies --headless). Big speedup for physics-only "
+                        "training. Breaks any sensor that needs rendering "
+                        "(camera, lidar) — safe here since we only use "
+                        "State / Electrics / Damage.")
     p.add_argument("--no-journal", action="store_true",
                    help="Skip writing an entry to RUNS.md (useful for smoke "
                         "tests).")
@@ -81,7 +87,13 @@ def main():
     print("=" * 64)
     print(f"Run name:         {run_name}")
     print(f"Timesteps:        {args.timesteps:,}")
-    print(f"Mode:             {'headless' if args.headless else 'headed (windowed)'}")
+    if args.nogpu:
+        mode_str = "nogpu (no rendering, implies headless)"
+    elif args.headless:
+        mode_str = "headless"
+    else:
+        mode_str = "headed (windowed)"
+    print(f"Mode:             {mode_str}")
     print(f"BeamNG home:      {args.home}")
     print(f"BeamNG launch:    "
           f"{'NEW (launching fresh)' if args.launch else 'NO (attaching to existing)'}")
@@ -97,7 +109,7 @@ def main():
     train_env = Monitor(
         make_beamng_env(
             random_spawn=True, home=args.home, host=args.host, port=args.port,
-            launch=args.launch, headless=args.headless,
+            launch=args.launch, headless=args.headless, nogpu=args.nogpu,
         ),
         filename=str(log_dir / "train"),
         info_keywords=monitor_info_keys,
@@ -107,7 +119,7 @@ def main():
     # always — we don't want a second BeamNG window.
     eval_env = make_beamng_env(
         random_spawn=False, home=args.home, host=args.host, port=args.port,
-        launch=False, headless=args.headless,
+        launch=False, headless=args.headless, nogpu=args.nogpu,
     )
 
     # v1: PPO with the hyperparameters from docs/phase1_env_spec.md.

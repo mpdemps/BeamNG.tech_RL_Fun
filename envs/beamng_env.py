@@ -6,7 +6,7 @@ Plain-language overview, Mikey:
 - It tells the AI what it can see (9 numbers about the car and the track).
 - It tells the AI what buttons it can push (2 numbers: steering, gas/brake).
 - It tells the AI when it wins (lap finished) or loses (crash, off-track, stuck).
-- Each game-tick, we ask BeamNG to fast-forward 50 ms of car-time and then
+- Each game-tick, we ask BeamNG to fast-forward 100 ms of car-time and then
   look at what changed.
 
 We follow the methodology in docs/phase1_env_spec.md. The rtgym wrapper
@@ -29,7 +29,9 @@ from beamngpy.sensors import Damage, Electrics, State
 MAP_NAME = "west_coast_usa"
 VEHICLE_MODEL = "etk800"            # the ETK 800 sedan BeamNG just spawned
 VEHICLE_ID = "ego"
-PHYSICS_STEPS_PER_STEP = 3          # 3 steps at 60 Hz = 50 ms = 20 Hz env tick
+PHYSICS_STEPS_PER_STEP = 6          # 6 steps at 60 Hz = 100 ms = 10 Hz env tick.
+                                    # Doubled from 3 to halve Python<->BeamNG
+                                    # socket round-trips per env step.
 DETERMINISTIC_STEPS_PER_S = 60
 MAX_SPEED_M_S = 70.0                # for obs normalization
 MAX_LOOKAHEAD_DIST_M = 200.0
@@ -86,7 +88,7 @@ _shared: dict = {"bng": None, "vehicle": None, "initialized": False}
 
 
 def _connect(home: Optional[str], host: str, port: int, launch: bool,
-             headless: bool) -> None:
+             headless: bool, nogpu: bool) -> None:
     """Open BeamNG, load our scenario, and put it in deterministic mode.
 
     Idempotent: once initialization succeeds, repeat calls do nothing.
@@ -97,7 +99,14 @@ def _connect(home: Optional[str], host: str, port: int, launch: bool,
     """
     if _shared["initialized"]:
         return
-    bng = BeamNGpy(host, port, home=home)
+    # headless and nogpu both belong on the BeamNGpy constructor, not
+    # bng.open(). headless appends "-headless" to the BeamNG.tech.exe
+    # command line so no window appears; nogpu additionally appends
+    # "-gfx null" to skip the rendering pipeline entirely (sensors that
+    # require rendering — camera, lidar — go unavailable). BeamNGpy's own
+    # constructor logic forces headless=True whenever nogpu=True. Both
+    # options are only effective with launch=True.
+    bng = BeamNGpy(host, port, home=home, headless=headless, nogpu=nogpu)
     bng.open(launch=launch)
 
     scenario = Scenario(MAP_NAME, "phase1_lap")
@@ -124,13 +133,6 @@ def _connect(home: Optional[str], host: str, port: int, launch: bool,
         # Older BeamNGpy API — fall back to the legacy top-level call.
         bng.set_deterministic(DETERMINISTIC_STEPS_PER_S)
 
-    if headless:
-        # TODO: confirm the right BeamNGpy 0.34+ call for hiding the window.
-        try:
-            bng.hide_hud()
-        except Exception:
-            pass
-
     _shared["bng"] = bng
     _shared["vehicle"] = vehicle
     _shared["initialized"] = True
@@ -143,7 +145,8 @@ class BeamNGRaceEnv(gymnasium.Env):
 
     def __init__(self, random_spawn: bool, home: Optional[str] = None,
                  host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
-                 launch: bool = False, headless: bool = False):
+                 launch: bool = False, headless: bool = False,
+                 nogpu: bool = False):
         super().__init__()
         # Connection params are stored here; we actually open BeamNG lazily
         # in reset(), so constructing the env never fails on its own.
@@ -153,6 +156,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         self.port = port
         self.launch = launch
         self.headless = headless
+        self.nogpu = nogpu
 
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(9,), dtype=np.float32)
@@ -170,7 +174,8 @@ class BeamNGRaceEnv(gymnasium.Env):
     def reset(self, seed=None, options=None):
         """Put the car at a spawn point and hand back the first observation."""
         super().reset(seed=seed)
-        _connect(self.home, self.host, self.port, self.launch, self.headless)
+        _connect(self.home, self.host, self.port, self.launch,
+                 self.headless, self.nogpu)
 
         if self.random_spawn:
             idx = int(self.np_random.integers(0, len(CENTERLINE)))
@@ -244,7 +249,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         return self._get_observation(), {}
 
     def step(self, action):
-        """Push the AI's buttons, advance 50 ms of car-time, then look around."""
+        """Push the AI's buttons, advance 100 ms of car-time, then look around."""
         # action[0] -> steering in [-1, 1]
         # action[1] -> throttle (>0) or brake (<0)
         steer = float(np.clip(action[0], -1.0, 1.0))
@@ -254,7 +259,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         _shared["vehicle"].control(steering=steer, throttle=throttle,
                                    brake=brake)
 
-        # Advance 3 physics steps (~50 ms at 60 Hz).
+        # Advance 6 physics steps (~100 ms at 60 Hz).
         # TODO(v2 rtgym migration): replace this with rtgym's elastic
         # real-time clock once Tuple-obs handling is sorted out. See
         # docs/references.md (TMRL) for the precedent. Plain bng.step() is
@@ -519,9 +524,10 @@ def _quat_rotate_x(quat) -> tuple:
 
 def make_beamng_env(random_spawn: bool, home: Optional[str] = None,
                     host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
-                    launch: bool = False, headless: bool = False):
+                    launch: bool = False, headless: bool = False,
+                    nogpu: bool = False):
     """Return a fresh BeamNGRaceEnv. No rtgym wrapping in v1."""
     return BeamNGRaceEnv(
         random_spawn=random_spawn, home=home, host=host, port=port,
-        launch=launch, headless=headless,
+        launch=launch, headless=headless, nogpu=nogpu,
     )
