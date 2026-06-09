@@ -1,0 +1,18 @@
+# Starts beamng-train.service at 22:00 daily.
+#
+# DO NOT ENABLE THIS TIMER YET. The automation is being proven first; the run
+# size in overnight_train.sh is a known-insufficient placeholder. Arm this only
+# after the reward/entropy work, once a working run size is known. Enabling:
+#   sudo systemctl enable --now beamng-train.timer
+
+[Unit]
+Description=Start BeamNG overnight training at 22:00
+
+[Timer]
+OnCalendar=*-*-* 22:00:00
+# Persistent=false: if 22:00 was missed (box off), do NOT fire a catch-up run
+# on the next boot -- training must only start inside its intended window.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

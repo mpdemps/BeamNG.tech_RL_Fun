@@ -1,0 +1,11 @@
+# Gracefully stops beamng-train.service. `systemctl stop` delivers SIGINT
+# (KillSignal in beamng-train.service), which train_beamng.py catches and turns
+# into a clean save-and-exit. Stopping a service that is not running is a
+# harmless no-op, so this is safe to fire even when no training is active.
+
+[Unit]
+Description=Gracefully stop BeamNG overnight training (SIGINT -> save + exit)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl stop beamng-train.service

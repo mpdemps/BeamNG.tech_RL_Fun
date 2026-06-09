@@ -1,0 +1,38 @@
+# BeamNG overnight RL training -- one bounded run, never auto-restarts.
+#
+# Started by beamng-train.timer (22:00) or manually for testing. Stopped by
+# beamng-train-stop.timer (08:00) via `systemctl stop`, which -- because
+# KillSignal=SIGINT -- triggers train_beamng.py's graceful save-and-close path
+# (the same path Ctrl+C uses). Verify that path with the SIGINT test in
+# scripts/systemd/README.md before trusting any unattended run.
+#
+# Install: copy to /etc/systemd/system/ (see scripts/systemd/README.md).
+
+[Unit]
+Description=BeamNG overnight RL training (one bounded run, no auto-restart)
+After=network.target
+
+[Service]
+Type=simple
+User=mike
+WorkingDirectory=/home/mike/projects/beamng-mikey
+ExecStart=/home/mike/projects/beamng-mikey/scripts/overnight_train.sh
+
+# HARD CONSTRAINT: a crashed or completed run must NOT respawn and fight the
+# Honcho/wger Docker stacks for CPU. It runs its window and stops.
+Restart=no
+
+# Graceful stop: SIGINT hits train_beamng.py's except KeyboardInterrupt ->
+# finally (save final model, close BeamNG). KillMode=mixed sends SIGINT to the
+# main python process only, then SIGKILLs any stragglers after TimeoutStopSec.
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=120
+
+# Yield CPU to the Docker stacks (10 containers, CPUWeight default 100) under
+# contention. Training only wins CPU that the containers are not using.
+CPUWeight=20
+Nice=10
+
+# No [Install] section on purpose: this unit is triggered by the timer or run
+# manually, never enabled to start on boot.

@@ -1,0 +1,19 @@
+# Stops beamng-train.service at 08:00 daily, ending the overnight window so
+# training never bleeds into the day and contends with the Docker stacks.
+#
+# Safe to enable independently of the start timer (stopping a non-running
+# service is a no-op). Enabling:
+#   sudo systemctl enable --now beamng-train-stop.timer
+
+[Unit]
+Description=Stop BeamNG overnight training at 08:00
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+# Persistent=false: never replay a missed 08:00 stop on a later boot. Combined
+# with the no-op-when-not-running behavior, this makes a spurious stop firing
+# impossible to cause harm.
+Persistent=false
+
+[Install]
+WantedBy=timers.target
