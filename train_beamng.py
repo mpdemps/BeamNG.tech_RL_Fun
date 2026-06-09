@@ -110,7 +110,10 @@ def main():
     monitor_info_keys = ("raw_progress", "alignment", "final_reward")
     train_env = Monitor(
         make_beamng_env(
-            random_spawn=True, home=args.home, host=args.host, port=args.port,
+            # Curriculum: fixed start at the start/finish line (idx=0) every
+            # episode, so the car learns the track as a sequence and gets
+            # further each time. (random_spawn=False -> idx=0, heading 0, rest.)
+            random_spawn=False, home=args.home, host=args.host, port=args.port,
             launch=args.launch, headless=args.headless, nogpu=args.nogpu,
         ),
         filename=str(log_dir / "train"),
