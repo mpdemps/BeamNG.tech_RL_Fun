@@ -6,7 +6,7 @@ Plain-language overview, Mikey:
 - It tells the AI what it can see (9 numbers about the car and the track).
 - It tells the AI what buttons it can push (2 numbers: steering, gas/brake).
 - It tells the AI when it wins (lap finished) or loses (crash, off-track, stuck).
-- Each game-tick, we ask BeamNG to fast-forward 100 ms of car-time and then
+- Each game-tick, we ask BeamNG to fast-forward 50 ms of car-time and then
   look at what changed.
 
 We follow the methodology in docs/phase1_env_spec.md. The rtgym wrapper
@@ -29,9 +29,7 @@ from beamngpy.sensors import Damage, Electrics, State
 MAP_NAME = "west_coast_usa"
 VEHICLE_MODEL = "etk800"            # the ETK 800 sedan BeamNG just spawned
 VEHICLE_ID = "ego"
-PHYSICS_STEPS_PER_STEP = 6          # 6 steps at 60 Hz = 100 ms = 10 Hz env tick.
-                                    # Doubled from 3 to halve Python<->BeamNG
-                                    # socket round-trips per env step.
+PHYSICS_STEPS_PER_STEP = 3          # 3 steps at 60 Hz = 50 ms = 20 Hz env tick.
 DETERMINISTIC_STEPS_PER_S = 60
 MAX_SPEED_M_S = 70.0                # for obs normalization
 MAX_LOOKAHEAD_DIST_M = 200.0
@@ -172,12 +170,28 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._last_final_reward = 0.0
 
     def reset(self, seed=None, options=None):
-        """Put the car at a spawn point and hand back the first observation."""
+        """Put the car at a spawn point and hand back the first observation.
+
+        Spawn-selection contract:
+        - If `options` is a dict containing "spawn_idx", that index is used
+          verbatim (modulo centerline length for safety), with heading
+          offset and start speed forced to 0 — fully deterministic spawn.
+          This path is for eval/debug from a chosen position; it overrides
+          both `random_spawn=True` and the deterministic idx=0 default.
+        - Otherwise, behavior is the constructor-time default: random idx /
+          heading / speed when `random_spawn=True`, else idx=0 from rest.
+        """
         super().reset(seed=seed)
         _connect(self.home, self.host, self.port, self.launch,
                  self.headless, self.nogpu)
 
-        if self.random_spawn:
+        forced_idx = (options.get("spawn_idx")
+                      if isinstance(options, dict) else None)
+        if forced_idx is not None:
+            idx = int(forced_idx) % len(CENTERLINE)
+            heading_offset = 0.0
+            start_speed = 0.0
+        elif self.random_spawn:
             idx = int(self.np_random.integers(0, len(CENTERLINE)))
             heading_offset = math.radians(float(self.np_random.uniform(
                 -RANDOM_HEADING_DEG, RANDOM_HEADING_DEG)))
@@ -249,7 +263,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         return self._get_observation(), {}
 
     def step(self, action):
-        """Push the AI's buttons, advance 100 ms of car-time, then look around."""
+        """Push the AI's buttons, advance 50 ms of car-time, then look around."""
         # action[0] -> steering in [-1, 1]
         # action[1] -> throttle (>0) or brake (<0)
         steer = float(np.clip(action[0], -1.0, 1.0))
@@ -259,7 +273,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         _shared["vehicle"].control(steering=steer, throttle=throttle,
                                    brake=brake)
 
-        # Advance 6 physics steps (~100 ms at 60 Hz).
+        # Advance 3 physics steps (~50 ms at 60 Hz).
         # TODO(v2 rtgym migration): replace this with rtgym's elastic
         # real-time clock once Tuple-obs handling is sorted out. See
         # docs/references.md (TMRL) for the precedent. Plain bng.step() is
