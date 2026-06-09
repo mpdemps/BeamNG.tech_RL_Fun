@@ -41,7 +41,15 @@ STOPPED_SPEED_M_S = 0.5             # below this, treat the car as stationary
 FLIP_PENALTY = -10.0
 OFF_TRACK_PENALTY = -10.0
 STUCK_PENALTY = -5.0
-LAP_BONUS = 50.0
+LAP_BONUS = 100.0                   # jackpot for completing the lap (the goal)
+# Curriculum: the centerline is split into N_CHECKPOINTS evenly-spaced (by
+# distance) segments. The first time per episode the car's cumulative progress
+# reaches an intermediate checkpoint, it earns CHECKPOINT_BONUS once -- a clear
+# "got further" spike ON TOP of the per-step progress reward (~1-1.5/tick,
+# ~273 accumulated per segment), small enough not to swamp smooth driving. The
+# final checkpoint is the finish line, rewarded by LAP_BONUS instead.
+N_CHECKPOINTS = 16
+CHECKPOINT_BONUS = 10.0
 RANDOM_HEADING_DEG = 0.0            # intentionally 0 for early training:
                                     # deterministic spawn along the tangent
                                     # gives a sharper learning signal. Widen
@@ -169,6 +177,17 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._last_raw_alignment = 1.0   # signed; 1.0 = "no data yet"
         self._last_final_reward = 0.0
 
+        # Curriculum checkpoints: cumulative-distance thresholds at evenly
+        # spaced fractions of the total track length (k=1..N_CHECKPOINTS-1 are
+        # intermediate; the final fraction is the finish line / LAP_BONUS).
+        track_length = sum(_dist(CENTERLINE[i], CENTERLINE[i + 1])
+                           for i in range(len(CENTERLINE) - 1))
+        self._checkpoint_distances = [
+            k / N_CHECKPOINTS * track_length for k in range(1, N_CHECKPOINTS)
+        ]
+        self._checkpoints_hit: set = set()
+        self._checkpoints_reached = 0
+
     def reset(self, seed=None, options=None):
         """Put the car at a spawn point and hand back the first observation.
 
@@ -240,6 +259,8 @@ class BeamNGRaceEnv(gymnasium.Env):
 
         self._last_centerline_dist = self._distance_along_centerline()
         self._steps_since_progress = 0
+        self._checkpoints_hit = set()
+        self._checkpoints_reached = 0
         return self._get_observation(), {}
 
     def step(self, action):
@@ -274,6 +295,7 @@ class BeamNGRaceEnv(gymnasium.Env):
             "raw_progress": float(self._last_raw_progress),
             "alignment": float(self._last_raw_alignment),
             "final_reward": float(self._last_final_reward),
+            "checkpoints_reached": int(self._checkpoints_reached),
         }
         return obs, reward + term_bonus, terminated, truncated, info
 
@@ -393,7 +415,19 @@ class BeamNGRaceEnv(gymnasium.Env):
             self._steps_since_progress = 0
         else:
             self._steps_since_progress += 1
-        return float(final_reward)
+
+        # Checkpoint bonuses: the first time this episode cumulative distance d
+        # crosses each evenly-spaced checkpoint, award CHECKPOINT_BONUS once.
+        # _checkpoints_hit is cleared each reset, so wiggling back and forth
+        # across a line can't farm it. This sits ON TOP of the progress reward;
+        # the stuck counter above stays keyed on progress, not these spikes.
+        checkpoint_bonus = 0.0
+        for k, thresh in enumerate(self._checkpoint_distances):
+            if k not in self._checkpoints_hit and d >= thresh:
+                self._checkpoints_hit.add(k)
+                self._checkpoints_reached += 1
+                checkpoint_bonus += CHECKPOINT_BONUS
+        return float(final_reward + checkpoint_bonus)
 
     def _check_done(self) -> Tuple[bool, float]:
         """Did the episode end? If so, what bonus or penalty applies?"""

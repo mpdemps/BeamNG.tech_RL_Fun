@@ -107,7 +107,8 @@ def main():
     # Monitor logs ep-end values of the listed info-dict keys to a CSV
     # alongside the standard r/l/t columns. NOTE: this is per-EPISODE-END,
     # not per-step — for true per-step CSV we'd need a custom callback.
-    monitor_info_keys = ("raw_progress", "alignment", "final_reward")
+    monitor_info_keys = ("raw_progress", "alignment", "final_reward",
+                         "checkpoints_reached")
     train_env = Monitor(
         make_beamng_env(
             # Curriculum: fixed start at the start/finish line (idx=0) every
