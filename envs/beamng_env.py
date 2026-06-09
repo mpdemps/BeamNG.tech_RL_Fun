@@ -218,43 +218,23 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._teleport_to(idx, sent_quat, start_speed)
         _shared["vehicle"].sensors.poll()
 
-        # Round-trip diagnostic: compare the quat we sent to the one BeamNG
-        # reports back. If they're nearly equal, the orientation pipeline is
-        # clean and any apparent "spawn direction wrong" issue lives elsewhere
-        # (centerline geometry, vehicle visual model, or sensor semantics).
-        # If they differ, the math/protocol is the actual problem.
-        read_quat = _shared["vehicle"].sensors["agent_state"].get(
-            "rotation", (0.0, 0.0, 0.0, 1.0))
-        measured_yaw = _quat_to_yaw(read_quat)
-        delta = (measured_yaw - final_yaw + math.pi) % (2 * math.pi) - math.pi
-
-        # Forward-vector diagnostic: rotate world +X by the read quat. If
-        # we asked for yaw=A°, this vector should be (cos A°, sin A°, ~0).
-        # A discrepancy means BeamNG's local-forward axis isn't +X.
-        forward_vec = _quat_rotate_x(read_quat)
-        vec_yaw = math.atan2(forward_vec[1], forward_vec[0])
-
+        # Spawn diagnostic: intended yaw plus the raw tangent inputs that
+        # produced it. We deliberately do NOT read orientation back from the
+        # sensor here. sensors.poll() fires before the teleport settles, so the
+        # read-back is one frame stale -- it reports the *previous* spawn's
+        # orientation, not this one. That stale read is exactly what made idx=0
+        # look like a 179-degree spawn bug: the car actually settles to the
+        # correct heading within the first step(). intended yaw and the hand
+        # tangent below are computed from the centerline and are correct.
         print(
             f"[reset] spawn idx={idx}, "
-            f"intended yaw={math.degrees(final_yaw):+.1f}°, "
-            f"sent quat=({sent_quat[0]:+.3f}, {sent_quat[1]:+.3f}, "
-            f"{sent_quat[2]:+.3f}, {sent_quat[3]:+.3f}), "
-            f"read quat=({read_quat[0]:+.3f}, {read_quat[1]:+.3f}, "
-            f"{read_quat[2]:+.3f}, {read_quat[3]:+.3f}), "
-            f"measured yaw={math.degrees(measured_yaw):+.1f}°, "
-            f"delta={math.degrees(delta):+.1f}°\n"
+            f"intended yaw={math.degrees(final_yaw):+.1f}°\n"
             f"[reset]   hand tangent: "
             f"prev=({prev_pt[0]:.2f}, {prev_pt[1]:.2f}, {prev_pt[2]:.2f}) "
             f"curr=({curr_pt[0]:.2f}, {curr_pt[1]:.2f}, {curr_pt[2]:.2f}) "
             f"next=({next_pt[0]:.2f}, {next_pt[1]:.2f}, {next_pt[2]:.2f}), "
             f"dx={hand_dx:+.3f} dy={hand_dy:+.3f}, "
-            f"atan2={math.degrees(hand_atan2):+.2f}° "
-            f"(should match intended)\n"
-            f"[reset]   forward(+X·read_quat)="
-            f"({forward_vec[0]:+.4f}, {forward_vec[1]:+.4f}, "
-            f"{forward_vec[2]:+.4f}), "
-            f"atan2(fy,fx)={math.degrees(vec_yaw):+.2f}° "
-            f"(should match measured)",
+            f"atan2={math.degrees(hand_atan2):+.2f}° (matches intended)",
             flush=True,
         )
 
@@ -504,34 +484,6 @@ def _yaw_to_quat(yaw: float):
     """
     half = yaw / 2.0
     return (0.0, 0.0, math.sin(half), math.cos(half))
-
-
-def _quat_to_yaw(quat) -> float:
-    """Extract yaw (rotation about +Z) from a quaternion in (x, y, z, w) order.
-
-    Standard ZYX-intrinsic Tait-Bryan decomposition. For a pure-yaw quat
-    (0, 0, sin(θ/2), cos(θ/2)) this returns θ exactly; for a quat with
-    pitch/roll mixed in, it returns the yaw component of that decomposition.
-    """
-    x, y, z, w = quat[0], quat[1], quat[2], quat[3]
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    return math.atan2(siny_cosp, cosy_cosp)
-
-
-def _quat_rotate_x(quat) -> tuple:
-    """Apply rotation `quat` (x, y, z, w) to the world +X axis.
-
-    Returns (fx, fy, fz) — the actual forward vector the rotation produces
-    on a unit-+X starting direction. Bypasses yaw-extraction shortcuts;
-    useful for checking whether BeamNG interprets our quat differently
-    than our atan2-based yaw extraction would suggest.
-    """
-    x, y, z, w = quat[0], quat[1], quat[2], quat[3]
-    fx = 1.0 - 2.0 * (y * y + z * z)
-    fy = 2.0 * (x * y + z * w)
-    fz = 2.0 * (x * z - y * w)
-    return (fx, fy, fz)
 
 
 # ---- Factory: kept for symmetry with the old API, now a trivial wrapper ----
