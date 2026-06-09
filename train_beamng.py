@@ -32,7 +32,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from stable_baselines3.common.monitor import Monitor
 
-from envs.beamng_env import make_beamng_env
+from envs.beamng_env import make_beamng_env, _shared
 
 
 def parse_args():
@@ -201,6 +201,17 @@ def main():
             )
         train_env.close()
         eval_env.close()
+        # The env close()s above are intentional no-ops (the shared BeamNG
+        # connection is kept open mid-run so train_env and eval_env don't
+        # tear each other down). The run is genuinely done now, so terminate
+        # the launched BeamNG process — otherwise it lingers holding the
+        # TechCom port and the next launch fights the zombie for it.
+        bng = _shared.get("bng")
+        if bng is not None:
+            try:
+                bng.close()
+            except Exception as e:
+                print(f"BeamNG close() raised {e!r} (ignoring)")
 
 
 def _append_run_journal(*, run_name, started, hyperparams, target_timesteps,
