@@ -44,8 +44,9 @@ stop`, and confirm it saved exactly like Ctrl+C does.
 
 ```bash
 # 1. Start a SHORT run so the test is quick (override the placeholder size).
-#    systemctl start blocks until the service is active, so background it.
-sudo systemctl set-environment TIMESTEPS=8000
+#    NO_JOURNAL=1 makes the wrapper pass --no-journal so this throwaway test
+#    run does not append a junk entry to RUNS.md.
+sudo systemctl set-environment TIMESTEPS=8000 NO_JOURNAL=1
 sudo systemctl start beamng-train.service
 
 # 2. Watch the log until it is past the first [reset] and actually stepping
@@ -62,8 +63,8 @@ ls -l ~/projects/beamng-mikey/checkpoints/overnight_*/final.zip   # final model 
 pgrep -f BinLinux/BeamNG.tech.x64 || echo "BeamNG terminated"     # no orphan
 ss -tlnp | grep 25252 || echo "port 25252 free"                   # port released
 
-# 5. Clean up the test environment override.
-sudo systemctl unset-environment TIMESTEPS
+# 5. Clean up the test environment overrides.
+sudo systemctl unset-environment TIMESTEPS NO_JOURNAL
 ```
 
 Pass = step 4 shows the "Saving final model" line, `final.zip` exists, BeamNG is

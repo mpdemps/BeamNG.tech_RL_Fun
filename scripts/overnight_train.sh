@@ -34,8 +34,11 @@ sleep 2  # let the OS release port 25252 before the fresh launch
 # 08:00 SIGINT (KillSignal in beamng-train.service) lands on python, which
 # handles it gracefully (saves final model, closes BeamNG), not on a wrapper
 # shell that would not forward it.
+# NO_JOURNAL (set to anything) appends --no-journal, so throwaway runs (e.g. the
+# SIGINT graceful-stop test) don't pollute RUNS.md. Real runs leave it unset.
 exec ./venv/bin/python train_beamng.py \
     --run-name "$RUN" \
     --timesteps "${TIMESTEPS:-250000}" \
     --nogpu \
+    ${NO_JOURNAL:+--no-journal} \
     >> "$LOGDIR/$RUN.log" 2>&1
