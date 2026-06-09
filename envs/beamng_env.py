@@ -98,7 +98,7 @@ def _connect(home: Optional[str], host: str, port: int, launch: bool,
     if _shared["initialized"]:
         return
     # headless and nogpu both belong on the BeamNGpy constructor, not
-    # bng.open(). headless appends "-headless" to the BeamNG.tech.exe
+    # bng.open(). headless appends "-headless" to the BeamNG.tech.x64
     # command line so no window appears; nogpu additionally appends
     # "-gfx null" to skip the rendering pipeline entirely (sensors that
     # require rendering — camera, lidar — go unavailable). BeamNGpy's own

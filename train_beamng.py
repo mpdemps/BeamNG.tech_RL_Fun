@@ -12,13 +12,13 @@ Plain-language overview, Mikey:
   we tried.
 
 By default this launches a fresh BeamNG instance — a manually-launched
-BeamNG.tech.exe doesn't open the TechCom port for Python, so attaching to
+BeamNG.tech.x64 doesn't open the TechCom port for Python, so attaching to
 an existing instance (--no-launch) is rarely useful and exists only for
 debugging.
 
 Troubleshooting:
-- If a previous run crashed partway through, a BeamNG.tech.exe process may
-  still be lingering. Kill it from Task Manager before re-running,
+- If a previous run crashed partway through, a BeamNG.tech.x64 process may
+  still be lingering. Kill it with `pkill -f BeamNG` before re-running,
   otherwise the new BeamNG launch will fight the zombie one for the
   BeamNGpy port and hang.
 """
@@ -46,9 +46,9 @@ def parse_args():
                    help="How often EvalCallback runs (in env steps).")
     p.add_argument("--checkpoint-freq", type=int, default=25_000,
                    help="How often to save a rolling checkpoint.")
-    p.add_argument("--home", default=os.environ.get(
-        "BEAMNG_HOME", r"C:\BeamNG\BeamNG.tech.v0.38.5.0"),
-                   help="BeamNG.tech install directory.")
+    p.add_argument("--home", default=os.environ.get("BEAMNG_HOME"),
+                   help="BeamNG.tech install directory. Defaults to the "
+                        "BEAMNG_HOME env var.")
     p.add_argument("--host", default="localhost")
     p.add_argument("--port", type=int, default=25252)
     p.add_argument("--no-launch", dest="launch", action="store_false",
@@ -73,6 +73,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if not args.home:
+        raise SystemExit("Set BEAMNG_HOME or pass --home (path to the BeamNG.tech install).")
     run_name = (args.run_name
                 or f"phase1_{datetime.datetime.now():%Y%m%d_%H%M%S}")
 

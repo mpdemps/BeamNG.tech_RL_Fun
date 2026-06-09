@@ -50,7 +50,7 @@ POLL_INTERVAL_RECORD_S = 0.5   # position-recording cadence once moving
 MOTION_THRESHOLD_M_S = 2.0     # car must exceed this speed to start recording
 DEDUPE_MIN_DIST_M = 1.0
 
-DEFAULT_HOME = r"C:\BeamNG\BeamNG.tech.v0.38.5.0"
+DEFAULT_HOME = None
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 25252
 OUTPUT_PATH = Path("data/centerline_racetrack.py")
@@ -165,6 +165,8 @@ def write_centerline(path: Path, points, length_m: float):
 
 def main():
     args = parse_args()
+    if not args.home:
+        raise SystemExit("Set BEAMNG_HOME or pass --home (path to the BeamNG.tech install).")
 
     print("Launching BeamNG (West Coast USA, ETK 800)...")
     bng = BeamNGpy(args.host, args.port, home=args.home)

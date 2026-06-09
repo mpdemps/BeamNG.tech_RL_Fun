@@ -35,7 +35,7 @@ VEHICLE_ID = "ego_extract"
 SPAWN_POS = (394.70, -252.02, 145.16)
 SPAWN_QUAT = (0.0, 0.0, 0.0, 1.0)
 
-DEFAULT_HOME = r"C:\BeamNG\BeamNG.tech.v0.38.5.0"
+DEFAULT_HOME = None
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 25252
 OUTPUT_PATH = Path("data/centerline_racetrack_builtin.py")
@@ -168,6 +168,8 @@ def write_centerline(road_id, edges):
 
 def main():
     args = parse_args()
+    if not args.home:
+        raise SystemExit("Set BEAMNG_HOME or pass --home (path to the BeamNG.tech install).")
 
     print(f"Connecting to BeamNG at {args.host}:{args.port}...")
     bng = BeamNGpy(args.host, args.port, home=args.home)
