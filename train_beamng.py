@@ -73,6 +73,17 @@ class MilestoneSnapshotCallback(BaseCallback):
         return True
 
 
+# PPO entropy coefficient. The dead-policy 250k G14 run used 0.01 (confirmed
+# from its saved overnight_v1 model), so 0.01 is the CONTROL BASELINE here, not
+# a known fix -- entropy already failed once at this value on the old reward.
+# Held constant so the curriculum (fixed-start + checkpoint rewards) is the only
+# intervention, letting any learning be attributed to the curriculum rather than
+# a hyperparameter change. If the policy still collapses at 0.01 with the
+# curriculum, THAT is the evidence to revisit this and other causes (learning
+# rate, alignment-gate reward clamping, observation scaling).
+ENT_COEF = 0.01
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--run-name", default=None,
@@ -187,7 +198,7 @@ def main():
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.01,
+        ent_coef=ENT_COEF,
     )
     model = PPO(
         "MlpPolicy",
