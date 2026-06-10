@@ -27,10 +27,12 @@ from beamngpy.sensors import Damage, Electrics, State
 
 # ---- Tunable constants (one place to tweak everything) ----
 MAP_NAME = "west_coast_usa"
-VEHICLE_MODEL = "scintilla"         # Civetta Scintilla (default gts config);
-                                    # model codename verified via
-                                    # bng.vehicles.get_available(). Phase 2 car,
-                                    # much faster than run1's etk800 sedan.
+VEHICLE_MODEL = "scintilla"         # Civetta Scintilla; model codename verified
+                                    # via bng.vehicles.get_available(). Phase 2
+                                    # car, much faster than run1's etk800 sedan.
+VEHICLE_PART_CONFIG = "vehicles/scintilla/race.pc"   # Race config (Mikey's pick,
+                                    # not default gts). Exact .pc path verified
+                                    # inside content/vehicles/scintilla.zip.
 VEHICLE_ID = "ego"
 PHYSICS_STEPS_PER_STEP = 3          # 3 steps at 60 Hz = 50 ms = 20 Hz env tick.
 DETERMINISTIC_STEPS_PER_S = 60
@@ -163,7 +165,8 @@ def _connect(home: Optional[str], host: str, port: int, launch: bool,
     bng.open(launch=launch)
 
     scenario = Scenario(MAP_NAME, "phase1_lap")
-    vehicle = Vehicle(VEHICLE_ID, model=VEHICLE_MODEL)
+    vehicle = Vehicle(VEHICLE_ID, model=VEHICLE_MODEL,
+                      part_config=VEHICLE_PART_CONFIG)
     # BeamNG already attaches a sensor named "state" by default on vehicle
     # spawn (undocumented). We use "agent_state" to avoid the collision.
     vehicle.sensors.attach("agent_state", State())
