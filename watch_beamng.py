@@ -21,8 +21,8 @@ for proc in ("BeamNG.tech.exe", "support.exe"):
 
 from stable_baselines3 import PPO
 from envs.beamng_env import (
-    make_beamng_env, MAX_SPEED_M_S, CENTER_OFFSET_CLIP_M, MAX_LOOKAHEAD_DIST_M,
-    N_CHECKPOINTS, CHECKPOINT_BONUS, LAP_BONUS)
+    make_beamng_env, _shared, MAX_SPEED_M_S, CENTER_OFFSET_CLIP_M,
+    MAX_LOOKAHEAD_DIST_M, N_CHECKPOINTS, CHECKPOINT_BONUS, LAP_BONUS)
 
 DEFAULT_MODEL = "checkpoints/overnight_v1/best_model/best_model.zip"
 BEAMNG_HOME = r"C:\BeamNG\BeamNG.tech.v0.38.5.0"
@@ -148,6 +148,36 @@ def _draw(lines):
     _panel["drawn"], _panel["n"] = True, len(lines)
 
 
+def _report_active_config():
+    """Read back which vehicle config ACTUALLY spawned (not assumed) and print it,
+    so the watcher itself confirms the race config vs a silent gts fallback. The
+    distinguishing slot is scintilla_coilover_F: _race vs _adaptive (gts)."""
+    try:
+        cfg = _shared["vehicle"].get_part_config()
+        chosen = {}
+
+        def walk(n):
+            if isinstance(n, dict):
+                if n.get("id") and n.get("chosenPartName"):
+                    chosen[n["id"]] = n["chosenPartName"]
+                for v in n.values():
+                    walk(v)
+            elif isinstance(n, list):
+                for v in n:
+                    walk(v)
+
+        walk(cfg)
+        coil = chosen.get("scintilla_coilover_F", "?")
+        dash = chosen.get("scintilla_dash", "?")
+        tag = ("RACE" if "race" in coil
+               else "GTS (default/fallback!)" if "adaptive" in coil
+               else "UNKNOWN")
+        print(f"  ACTIVE CAR CONFIG: {tag}"
+              f"   (coilover_F={coil}, dash={dash})")
+    except Exception as e:
+        print(f"  (could not read active car config: {e!r})")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=DEFAULT_MODEL,
@@ -192,6 +222,8 @@ def main():
                         if args.spawn_idx is not None else {})
         for ep in range(args.episodes):
             obs, info = env.reset(**reset_kwargs)
+            if ep == 0:
+                _report_active_config()   # confirm race vs gts by read-back, once
             ep_reward = 0.0
             ep_steps = 0
             prev_cp = 0           # checkpoints reached as of last step
