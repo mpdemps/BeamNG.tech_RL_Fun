@@ -27,7 +27,10 @@ from beamngpy.sensors import Damage, Electrics, State
 
 # ---- Tunable constants (one place to tweak everything) ----
 MAP_NAME = "west_coast_usa"
-VEHICLE_MODEL = "etk800"            # the ETK 800 sedan BeamNG just spawned
+VEHICLE_MODEL = "scintilla"         # Civetta Scintilla (default gts config);
+                                    # model codename verified via
+                                    # bng.vehicles.get_available(). Phase 2 car,
+                                    # much faster than run1's etk800 sedan.
 VEHICLE_ID = "ego"
 PHYSICS_STEPS_PER_STEP = 3          # 3 steps at 60 Hz = 50 ms = 20 Hz env tick.
 DETERMINISTIC_STEPS_PER_S = 60
@@ -50,6 +53,20 @@ LAP_BONUS = 100.0                   # jackpot for completing the lap (the goal)
 # final checkpoint is the finish line, rewarded by LAP_BONUS instead.
 N_CHECKPOINTS = 16
 CHECKPOINT_BONUS = 10.0
+# Anti-crawl speed reward (run2): pays for going fast, but only when on the
+# racing line and pointed forward. speed_reward = SPEED_WEIGHT * forward_speed *
+# gated_alignment, so a crawling-for-safe-points car earns less than one that
+# carries speed. Kept SMALL so progress/checkpoint rewards stay dominant: the
+# Scintilla tops out far faster than run1's etk800, so at ~70 m/s a weight of
+# 0.02 (the original sedan figure) would swamp the ~1-1.5/tick progress reward
+# and reward reckless flooring. 0.0075 caps the term near ~0.5/tick. Tune up
+# only if the car still crawls.
+SPEED_WEIGHT = 0.0075
+# Anti-wobble smoothing penalty (run2): run1 steered bang-bang left-right
+# because nothing penalized it. smoothness_penalty = -SMOOTH_WEIGHT *
+# abs(steer - prev_steer) penalizes the CHANGE in steering, not steering itself,
+# so smooth sustained cornering is free and only rapid flip-flopping costs.
+SMOOTH_WEIGHT = 0.1
 # Monotonic progress tracker: each step we re-find the car's centerline index by
 # searching only a LOCAL window around the last index, never globally. This
 # keeps cumulative distance continuous across the start/finish seam (idx 0 and
@@ -75,6 +92,27 @@ SPAWN_Z_OFFSET_M = 1.0
 # (no-op); applied inside _smoothed_forward_yaw so a single value change
 # adjusts both the spawn orientation and the alignment-gate's tangent.
 SPAWN_YAW_BIAS_DEG = 0.0
+# Spawn-orientation frame correction (run2 fix). MEASURED in two stages by
+# scripts/spawn_angle_test.py, which reads the car's SETTLED forward vector after
+# each spawn (not the intended-heading math):
+#   1. With no correction, the settled heading was a rock-solid 90.6 deg
+#      CLOCKWISE of the centerline tangent (mean -90.61, std 0.02 over 15 trials).
+#   2. Applying a naive +90 deg offset did NOT cancel it -- it overshot to ~180
+#      deg (car pointed backwards). A pure offset would have predicted ~0; it
+#      gave 180. That disproves "offset" and proves a HANDEDNESS INVERSION:
+#      BeamNG's heading convention is the NEGATION of ours plus a 90 deg axis
+#      offset (its vehicle local forward is +Y, ours is atan2's +X). Empirically
+#      settled_dir ~= -sent_yaw - 90.
+# So to make the car settle along a desired world heading theta, we send
+#   sent_yaw = -theta - 90deg.
+# This corrects the SENT quaternion only; it deliberately does NOT touch
+# SPAWN_YAW_BIAS_DEG / _smoothed_forward_yaw, which feed the reward's alignment
+# tangent (already correct -- velocity and tangent both live in world XY there,
+# no frame issue). This is a spawn-encoding bug only, NOT a physics mirror: if
+# steering were mirrored run1 could not have driven 87% of the track. The old
+# belief that "the car settles to the correct heading within the first step" is
+# disproven; the mis-encoded heading is what handicapped run1.
+SPAWN_QUAT_YAW_CORRECTION_DEG = 90.0
 RANDOM_SPEED_MAX_M_S = 30.0
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 25252
@@ -185,6 +223,12 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._last_raw_progress = 0.0
         self._last_raw_alignment = 1.0   # signed; 1.0 = "no data yet"
         self._last_final_reward = 0.0
+        self._last_speed_reward = 0.0
+        self._last_smoothness_penalty = 0.0
+        # Steering smoothness tracker (run2): _cur_steer is this tick's steer,
+        # _prev_steer last tick's; their difference drives smoothness_penalty.
+        self._prev_steer = 0.0
+        self._cur_steer = 0.0
 
         # Cumulative arc length from CENTERLINE[0] to each index, plus the
         # full-loop track length. The monotonic progress tracker uses these.
@@ -246,8 +290,12 @@ class BeamNGRaceEnv(gymnasium.Env):
             start_speed = 0.0
 
         forward_yaw = self._smoothed_forward_yaw(idx)
-        final_yaw = forward_yaw + heading_offset
-        sent_quat = _yaw_to_quat(final_yaw)
+        final_yaw = forward_yaw + heading_offset   # desired world heading
+        # Invert BeamNG's heading convention so the car SETTLES at final_yaw:
+        # measured settled_dir ~= -sent_yaw - 90, so sent_yaw = -final_yaw - 90.
+        # (See SPAWN_QUAT_YAW_CORRECTION_DEG for the measurement.)
+        sent_yaw = -final_yaw - math.radians(SPAWN_QUAT_YAW_CORRECTION_DEG)
+        sent_quat = _yaw_to_quat(sent_yaw)
 
         # Hand-recompute the tangent so the print shows raw inputs (lets us
         # spot a unit-conversion or coordinate-frame mistake in the helper).
@@ -261,23 +309,26 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._teleport_to(idx, sent_quat, start_speed)
         _shared["vehicle"].sensors.poll()
 
-        # Spawn diagnostic: intended yaw plus the raw tangent inputs that
-        # produced it. We deliberately do NOT read orientation back from the
-        # sensor here. sensors.poll() fires before the teleport settles, so the
-        # read-back is one frame stale -- it reports the *previous* spawn's
-        # orientation, not this one. That stale read is exactly what made idx=0
-        # look like a 179-degree spawn bug: the car actually settles to the
-        # correct heading within the first step(). intended yaw and the hand
-        # tangent below are computed from the centerline and are correct.
+        # Spawn diagnostic: the track tangent (intended down-track heading), the
+        # frame correction we now apply (sent = -heading - 90), and the
+        # resulting sent yaw. We
+        # do NOT read orientation back here -- sensors.poll() fires before the
+        # teleport settles, so a read-back is one frame stale. The settled pose
+        # is instead measured out-of-band by scripts/spawn_angle_test.py, which
+        # is what proved the 90-deg offset this correction cancels. Do not trust
+        # an in-reset read-back for spawn validation; trust the offline test and
+        # the G14 visual check.
         print(
             f"[reset] spawn idx={idx}, "
-            f"intended yaw={math.degrees(final_yaw):+.1f}°\n"
+            f"desired heading={math.degrees(final_yaw):+.1f}° "
+            f"-> sent yaw={math.degrees(sent_yaw):+.1f}° "
+            f"(=-heading-{SPAWN_QUAT_YAW_CORRECTION_DEG:.0f}°, frame fix)\n"
             f"[reset]   hand tangent: "
             f"prev=({prev_pt[0]:.2f}, {prev_pt[1]:.2f}, {prev_pt[2]:.2f}) "
             f"curr=({curr_pt[0]:.2f}, {curr_pt[1]:.2f}, {curr_pt[2]:.2f}) "
             f"next=({next_pt[0]:.2f}, {next_pt[1]:.2f}, {next_pt[2]:.2f}), "
             f"dx={hand_dx:+.3f} dy={hand_dy:+.3f}, "
-            f"atan2={math.degrees(hand_atan2):+.2f}° (matches intended)",
+            f"atan2={math.degrees(hand_atan2):+.2f}°",
             flush=True,
         )
 
@@ -291,6 +342,9 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._steps_since_progress = 0
         self._checkpoints_hit = set()
         self._checkpoints_reached = 0
+        # No prior action at spawn, so the first step has zero steering change.
+        self._prev_steer = 0.0
+        self._cur_steer = 0.0
         return self._get_observation(), {}
 
     def step(self, action):
@@ -298,6 +352,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         # action[0] -> steering in [-1, 1]
         # action[1] -> throttle (>0) or brake (<0)
         steer = float(np.clip(action[0], -1.0, 1.0))
+        self._cur_steer = steer   # read by _compute_reward's smoothness penalty
         thr = float(np.clip(action[1], -1.0, 1.0))
         throttle = max(0.0, thr)
         brake = max(0.0, -thr)
@@ -328,6 +383,8 @@ class BeamNGRaceEnv(gymnasium.Env):
             "raw_progress": float(self._last_raw_progress),
             "alignment": float(self._last_raw_alignment),
             "final_reward": float(self._last_final_reward),
+            "speed_reward": float(self._last_speed_reward),
+            "smoothness_penalty": float(self._last_smoothness_penalty),
             "checkpoints_reached": int(self._checkpoints_reached),
             "lap_completed": bool(self._lap_done),
         }
@@ -442,9 +499,22 @@ class BeamNGRaceEnv(gymnasium.Env):
         gated_alignment = max(0.0, raw_alignment)
         final_reward = raw_progress * gated_alignment
 
+        # Anti-crawl speed reward: pay for carrying speed, but only on-line and
+        # pointed forward (gated_alignment is 0..1), so it never rewards fast
+        # off-track or reverse driving. Small by design (see SPEED_WEIGHT).
+        speed_reward = SPEED_WEIGHT * speed_horizontal * gated_alignment
+
+        # Anti-wobble penalty: penalize the CHANGE in steering vs last tick, so
+        # smooth sustained turns are free and only bang-bang flip-flopping costs.
+        smoothness_penalty = -SMOOTH_WEIGHT * abs(self._cur_steer
+                                                  - self._prev_steer)
+        self._prev_steer = self._cur_steer
+
         self._last_raw_progress = raw_progress
         self._last_raw_alignment = raw_alignment
         self._last_final_reward = final_reward
+        self._last_speed_reward = speed_reward
+        self._last_smoothness_penalty = smoothness_penalty
 
         if final_reward > 0.01:
             self._steps_since_progress = 0
@@ -462,7 +532,10 @@ class BeamNGRaceEnv(gymnasium.Env):
                 self._checkpoints_hit.add(k)
                 self._checkpoints_reached += 1
                 checkpoint_bonus += CHECKPOINT_BONUS
-        return float(final_reward + checkpoint_bonus)
+        # Existing progress/checkpoint terms stay dominant; the speed and
+        # smoothness terms are the small run2 nudges layered on top.
+        return float(final_reward + checkpoint_bonus
+                     + speed_reward + smoothness_penalty)
 
     def _check_done(self) -> Tuple[bool, float]:
         """Did the episode end? If so, what bonus or penalty applies?"""

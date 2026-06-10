@@ -159,6 +159,7 @@ def main():
     # alongside the standard r/l/t columns. NOTE: this is per-EPISODE-END,
     # not per-step — for true per-step CSV we'd need a custom callback.
     monitor_info_keys = ("raw_progress", "alignment", "final_reward",
+                         "speed_reward", "smoothness_penalty",
                          "checkpoints_reached")
     train_env = Monitor(
         make_beamng_env(

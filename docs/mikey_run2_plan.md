@@ -57,6 +57,25 @@ code and BeamNG's vehicle frame), not random failure.
 - Validate on the G14: watch a spawn and confirm the car points straight down the
   track from the start (no 90-degree recovery).
 
+### Validation gate (necessary AND sufficient only together)
+
+The headless re-measurement on the Mini PC is NECESSARY but NOT SUFFICIENT. We
+were misled all session by a Mini PC number that checked intent, not outcome.
+After the fix, Mike validates VISUALLY on the G14:
+
+- Load a model in watch_beamng.py and watch the spawn.
+- Confirm the car points straight down-track from the FIRST frame (no 90-degree
+  rotation, no drop-and-turn-left recovery).
+- Judge SPAWN ORIENTATION ONLY, not the subsequent driving. If validating with a
+  run1 model, the car will spawn straight but may then steer left out of trained
+  habit (it learned to fight the old broken spawn). That is EXPECTED and actually
+  confirms the fix.
+- The spawn fix is car-agnostic (shared _teleport_to), so this works the same
+  whether watching the etk800 or the Scintilla.
+
+HARD GATE: do NOT launch the full mikey_run2 until Mike confirms the G14 visual
+spawn check passes.
+
 Note: set_velocity is a known silent no-op in this BeamNG version; rotation is a
 separate call and IS sent (sent quat is correct), the problem is consistent
 mis-application, treat as its own issue, not the same as the velocity no-op.
@@ -69,9 +88,16 @@ accrues regardless of speed, so crawling is "safe points."
 - speed_reward = SPEED_WEIGHT * forward_speed * align
 - align is the existing alignment term (0..1), so speed only pays when on the
   racing line, pointed forward. (Mike: reward speed only when on-track/aligned.)
-- Start SPEED_WEIGHT small (~0.02) as a named constant. The existing
+- Start SPEED_WEIGHT small as a named constant. The existing
   progress/alignment/checkpoint rewards must stay dominant; this is a gentle
   nudge. Tune up if the car still crawls.
+- VEHICLE: phase 2 uses the Civetta Scintilla (model codename "scintilla",
+  verified via bng.vehicles.get_available(); default gts config) instead of
+  run1's etk800. Because the Scintilla is much faster, the original 0.02 weight
+  would swamp the progress/checkpoint terms and reward reckless flooring, so
+  start SPEED_WEIGHT at ~0.005-0.01 (set to 0.0075). The Scintilla is livelier
+  and easier to spin/overshoot, so early training may look messier and the
+  smoothness reward matters more, not less. That is expected, not a problem.
 
 ## Task 4: Add smooth-steering reward (anti-wobble)
 
