@@ -50,6 +50,15 @@ LAP_BONUS = 100.0                   # jackpot for completing the lap (the goal)
 # final checkpoint is the finish line, rewarded by LAP_BONUS instead.
 N_CHECKPOINTS = 16
 CHECKPOINT_BONUS = 10.0
+# Monotonic progress tracker: each step we re-find the car's centerline index by
+# searching only a LOCAL window around the last index, never globally. This
+# keeps cumulative distance continuous across the start/finish seam (idx 0 and
+# the last index are ~0.67 m apart; a global nearest-point search flips between
+# them and makes distance jump by a full lap). FWD must exceed the farthest the
+# car moves in one step (~1.5 m, far under 20 indices); BACK gives margin for a
+# spun or backward-sliding car.
+PROGRESS_WINDOW_BACK = 5
+PROGRESS_WINDOW_FWD = 20
 RANDOM_HEADING_DEG = 0.0            # intentionally 0 for early training:
                                     # deterministic spawn along the tangent
                                     # gives a sharper learning signal. Widen
@@ -177,17 +186,31 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._last_raw_alignment = 1.0   # signed; 1.0 = "no data yet"
         self._last_final_reward = 0.0
 
+        # Cumulative arc length from CENTERLINE[0] to each index, plus the
+        # full-loop track length. The monotonic progress tracker uses these.
+        n = len(CENTERLINE)
+        self._cum_arc = [0.0] * n
+        for i in range(1, n):
+            self._cum_arc[i] = self._cum_arc[i - 1] + _dist(
+                CENTERLINE[i - 1], CENTERLINE[i])
+        self._track_length = self._cum_arc[n - 1] + _dist(
+            CENTERLINE[n - 1], CENTERLINE[0])
+
         # Curriculum checkpoints: cumulative-distance thresholds at evenly
-        # spaced fractions of the total track length (k=1..N_CHECKPOINTS-1 are
-        # intermediate; the final fraction is the finish line / LAP_BONUS).
-        track_length = sum(_dist(CENTERLINE[i], CENTERLINE[i + 1])
-                           for i in range(len(CENTERLINE) - 1))
+        # spaced fractions of the track (k=1..N_CHECKPOINTS-1 are intermediate;
+        # the final fraction is the finish line / LAP_BONUS).
         self._checkpoint_distances = [
-            k / N_CHECKPOINTS * track_length for k in range(1, N_CHECKPOINTS)
+            k / N_CHECKPOINTS * self._track_length
+            for k in range(1, N_CHECKPOINTS)
         ]
         self._checkpoints_hit: set = set()
         self._checkpoints_reached = 0
-        self._lap_done = False           # set True on the step the lap completes
+
+        # Monotonic progress-tracker state (re-initialized each reset()).
+        self._progress_idx = 0    # car's current centerline index (windowed)
+        self._laps = 0            # forward seam crossings; -1 = just behind start
+        self._cur_centerline_dist = 0.0
+        self._lap_done = False    # set True on the step a genuine lap completes
 
     def reset(self, seed=None, options=None):
         """Put the car at a spawn point and hand back the first observation.
@@ -258,7 +281,13 @@ class BeamNGRaceEnv(gymnasium.Env):
             flush=True,
         )
 
-        self._last_centerline_dist = self._distance_along_centerline()
+        # Initialize the progress tracker at the spawn index, zero laps. d starts
+        # at the spawn's absolute arc position (0 for the fixed-start idx 0).
+        self._progress_idx = idx
+        self._laps = 0
+        self._lap_done = False
+        self._cur_centerline_dist = self._cum_arc[idx]
+        self._last_centerline_dist = self._cur_centerline_dist
         self._steps_since_progress = 0
         self._checkpoints_hit = set()
         self._checkpoints_reached = 0
@@ -284,6 +313,9 @@ class BeamNGRaceEnv(gymnasium.Env):
         _shared["bng"].step(PHYSICS_STEPS_PER_STEP)
 
         _shared["vehicle"].sensors.poll()
+        # Advance the monotonic progress tracker FIRST so the observation, the
+        # reward, and the done-check all read the same updated forward progress.
+        self._advance_progress(_shared["vehicle"].sensors["agent_state"]["pos"])
         obs = self._get_observation()
         reward = self._compute_reward()
         terminated, term_bonus = self._check_done()
@@ -349,7 +381,10 @@ class BeamNGRaceEnv(gymnasium.Env):
         forward = s.get("dir", (1.0, 0.0, 0.0))
         speed = math.sqrt(vel[0] ** 2 + vel[1] ** 2 + vel[2] ** 2)
 
-        idx = self._closest_checkpoint_idx(pos)
+        # Use the monotonic tracker's index (not a global nearest search) so the
+        # lookahead the policy sees matches the forward progress it's rewarded
+        # for -- consistent across the start/finish seam.
+        idx = self._progress_idx
         c_curr = CENTERLINE[idx]
         c1 = CENTERLINE[(idx + 1) % len(CENTERLINE)]
         c2 = CENTERLINE[(idx + 2) % len(CENTERLINE)]
@@ -385,13 +420,12 @@ class BeamNGRaceEnv(gymnasium.Env):
           - nearly stopped            -> alignment forced to 1.0 so a spun-out
                                          car isn't punished while recovering.
         """
-        d = self._distance_along_centerline()
+        d = self._cur_centerline_dist
         raw_progress = d - self._last_centerline_dist
         self._last_centerline_dist = d
 
         s = _shared["vehicle"].sensors["agent_state"]
         vel = s["vel"]
-        pos = s["pos"]
         speed_horizontal = math.sqrt(vel[0] ** 2 + vel[1] ** 2)
 
         if speed_horizontal < STOPPED_SPEED_M_S:
@@ -399,8 +433,7 @@ class BeamNGRaceEnv(gymnasium.Env):
             # at 1.0 so a spun-out car can recover without losing reward.
             raw_alignment = 1.0
         else:
-            idx = self._closest_checkpoint_idx(pos)
-            forward_yaw = self._smoothed_forward_yaw(idx)
+            forward_yaw = self._smoothed_forward_yaw(self._progress_idx)
             fx, fy = math.cos(forward_yaw), math.sin(forward_yaw)
             vx, vy = vel[0] / speed_horizontal, vel[1] / speed_horizontal
             raw_alignment = vx * fx + vy * fy   # signed, -1 to +1
@@ -433,28 +466,58 @@ class BeamNGRaceEnv(gymnasium.Env):
 
     def _check_done(self) -> Tuple[bool, float]:
         """Did the episode end? If so, what bonus or penalty applies?"""
-        self._lap_done = False
         if self._is_flipped():
             return True, FLIP_PENALTY
         if self._is_off_track():
             return True, OFF_TRACK_PENALTY
-        if self._lap_completed():
-            self._lap_done = True
+        if self._lap_done:   # set by _advance_progress on a genuine forward lap
             return True, LAP_BONUS
         if self._steps_since_progress > STUCK_STEPS_THRESHOLD:
             return True, STUCK_PENALTY
         return False, 0.0
 
-    def _distance_along_centerline(self) -> float:
-        """How far along the racing line the car currently is."""
-        pos = _shared["vehicle"].sensors["agent_state"]["pos"]
-        idx = self._closest_checkpoint_idx(pos)
-        cum = 0.0
-        for i in range(idx):
-            cum += _dist(CENTERLINE[i], CENTERLINE[i + 1])
-        cum += _project_along(pos, CENTERLINE[idx],
-                              CENTERLINE[(idx + 1) % len(CENTERLINE)])
-        return cum
+    def _advance_progress(self, pos) -> None:
+        """Update the monotonic progress tracker from the car's position.
+
+        Re-find the car's centerline index by searching only a LOCAL window
+        [-BACK, +FWD] around the last index -- never globally -- so the index
+        cannot flip across the start/finish seam (idx 0 <-> last index, ~0.67 m
+        apart) and make distance jump by a full lap. Cumulative distance is
+        d = laps * track_length + cum_arc[idx] + projection; the laps term
+        absorbs the seam wrap so d stays continuous (raw_progress is always
+        ~the real per-step travel, never a +/-track-length spike or cliff).
+        """
+        n = len(CENTERLINE)
+        best_o, best_d2 = 0, None
+        for o in range(-PROGRESS_WINDOW_BACK, PROGRESS_WINDOW_FWD + 1):
+            cand = (self._progress_idx + o) % n
+            d2 = _dist(pos, CENTERLINE[cand])
+            if best_d2 is None or d2 < best_d2:
+                best_d2, best_o = d2, o
+
+        raw_target = self._progress_idx + best_o
+        crossed_forward = raw_target >= n
+        if crossed_forward:
+            self._laps += 1
+        elif raw_target < 0:
+            self._laps -= 1
+
+        # A genuine lap = a forward seam crossing that leaves laps >= 1. The
+        # -1 -> 0 case (undoing a backward drift across the start) is also a
+        # forward crossing but leaves laps == 0, so it does NOT count -- this is
+        # what stops start-line wiggling from farming LAP_BONUS. Reaching laps
+        # >= 1 requires progress_idx near the last index with laps 0, which only
+        # happens after a genuine full forward traversal (cum_arc ~ track_len).
+        self._lap_done = crossed_forward and self._laps >= 1
+
+        self._progress_idx = raw_target % n
+        nxt = (self._progress_idx + 1) % n
+        seg_len = _dist(CENTERLINE[self._progress_idx], CENTERLINE[nxt])
+        proj = _project_along(pos, CENTERLINE[self._progress_idx],
+                              CENTERLINE[nxt])
+        proj = max(0.0, min(proj, seg_len))
+        self._cur_centerline_dist = (self._laps * self._track_length
+                                     + self._cum_arc[self._progress_idx] + proj)
 
     def _closest_checkpoint_idx(self, pos) -> int:
         return int(np.argmin([_dist(pos, c) for c in CENTERLINE]))
@@ -469,14 +532,6 @@ class BeamNGRaceEnv(gymnasium.Env):
         pos = _shared["vehicle"].sensors["agent_state"]["pos"]
         idx = self._closest_checkpoint_idx(pos)
         return _dist(pos, CENTERLINE[idx]) > OFF_TRACK_THRESHOLD_M
-
-    def _lap_completed(self) -> bool:
-        """Made it back to checkpoint 0 after going around the loop."""
-        # Placeholder: with the real centerline this will compare a lap-distance
-        # counter against the known track length.
-        pos = _shared["vehicle"].sensors["agent_state"]["pos"]
-        idx = self._closest_checkpoint_idx(pos)
-        return idx == 0 and self._last_centerline_dist > 50.0
 
 
 # ---- Small math helpers ----
