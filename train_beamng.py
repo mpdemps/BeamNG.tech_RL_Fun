@@ -29,10 +29,48 @@ import os
 from pathlib import Path
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+from stable_baselines3.common.callbacks import (
+    BaseCallback, CheckpointCallback, EvalCallback)
 from stable_baselines3.common.monitor import Monitor
 
 from envs.beamng_env import make_beamng_env, _shared
+
+
+class MilestoneSnapshotCallback(BaseCallback):
+    """Save a labeled model the first time the run hits a new milestone.
+
+    Tier 2 -- furthest checkpoint: each time `checkpoints_reached` (from the env
+    info dict) sets a new run-wide high-water mark, save
+    `milestone_cp{NN}_step{steps}.zip` ("first model to reach checkpoint NN").
+    Tier 3 -- lap trophy: the first time the env reports `lap_completed`, save
+    `milestone_lap_step{steps}.zip`. Together with Tier 1's rolling_* time
+    snapshots, these give Mikey the full learning arc, watchable in order.
+    """
+
+    def __init__(self, save_dir, verbose=1):
+        super().__init__(verbose)
+        self.save_dir = Path(save_dir)
+        self.furthest = 0       # run-wide max checkpoints_reached so far
+        self.lap_saved = False  # the lap trophy is saved once, on the first lap
+
+    def _on_step(self) -> bool:
+        for info in self.locals.get("infos", []):
+            cp = int(info.get("checkpoints_reached", 0))
+            if cp > self.furthest:
+                self.furthest = cp
+                path = self.save_dir / f"milestone_cp{cp:02d}_step{self.num_timesteps}.zip"
+                self.model.save(str(path))
+                if self.verbose:
+                    print(f"[milestone] first to reach checkpoint {cp} "
+                          f"at step {self.num_timesteps} -> {path.name}", flush=True)
+            if info.get("lap_completed") and not self.lap_saved:
+                self.lap_saved = True
+                path = self.save_dir / f"milestone_lap_step{self.num_timesteps}.zip"
+                self.model.save(str(path))
+                if self.verbose:
+                    print(f"[milestone] LAP COMPLETED at step {self.num_timesteps} "
+                          f"-> {path.name}  (the trophy!)", flush=True)
+        return True
 
 
 def parse_args():
@@ -44,8 +82,10 @@ def parse_args():
                    help="Total training timesteps.")
     p.add_argument("--eval-freq", type=int, default=10_000,
                    help="How often EvalCallback runs (in env steps).")
-    p.add_argument("--checkpoint-freq", type=int, default=25_000,
-                   help="How often to save a rolling checkpoint.")
+    p.add_argument("--checkpoint-freq", type=int, default=5_000,
+                   help="Tier 1: how often to save a rolling time-based "
+                        "checkpoint. 5000 steps ~= one snapshot every ~11 min, "
+                        "capturing the early flailing too. Files are ~150 KB.")
     p.add_argument("--home", default=os.environ.get("BEAMNG_HOME"),
                    help="BeamNG.tech install directory. Defaults to the "
                         "BEAMNG_HOME env var.")
@@ -174,6 +214,7 @@ def main():
         save_path=str(ckpt_dir),
         name_prefix="rolling",
     )
+    milestone_callback = MilestoneSnapshotCallback(save_dir=ckpt_dir, verbose=1)
 
     started = datetime.datetime.now()
     completed_timesteps = 0
@@ -181,7 +222,7 @@ def main():
     try:
         model.learn(
             total_timesteps=args.timesteps,
-            callback=[eval_callback, ckpt_callback],
+            callback=[eval_callback, ckpt_callback, milestone_callback],
             tb_log_name="ppo",
         )
         completed_timesteps = model.num_timesteps

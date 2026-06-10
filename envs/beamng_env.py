@@ -187,6 +187,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         ]
         self._checkpoints_hit: set = set()
         self._checkpoints_reached = 0
+        self._lap_done = False           # set True on the step the lap completes
 
     def reset(self, seed=None, options=None):
         """Put the car at a spawn point and hand back the first observation.
@@ -296,6 +297,7 @@ class BeamNGRaceEnv(gymnasium.Env):
             "alignment": float(self._last_raw_alignment),
             "final_reward": float(self._last_final_reward),
             "checkpoints_reached": int(self._checkpoints_reached),
+            "lap_completed": bool(self._lap_done),
         }
         return obs, reward + term_bonus, terminated, truncated, info
 
@@ -431,11 +433,13 @@ class BeamNGRaceEnv(gymnasium.Env):
 
     def _check_done(self) -> Tuple[bool, float]:
         """Did the episode end? If so, what bonus or penalty applies?"""
+        self._lap_done = False
         if self._is_flipped():
             return True, FLIP_PENALTY
         if self._is_off_track():
             return True, OFF_TRACK_PENALTY
         if self._lap_completed():
+            self._lap_done = True
             return True, LAP_BONUS
         if self._steps_since_progress > STUCK_STEPS_THRESHOLD:
             return True, STUCK_PENALTY
