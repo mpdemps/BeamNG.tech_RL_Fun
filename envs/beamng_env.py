@@ -61,11 +61,12 @@ CHECKPOINT_BONUS = 10.0
 # carries speed. run2 (0.0075) was big enough that the powerful race car learned
 # to FLOOR-AND-SPIN: a donut still drifts forward across the evenly-spaced
 # checkpoints, and at 0.0075 the speed reward outweighed careful driving. run3
-# cuts it ~75% to 0.002 so the spin's (low-align) speed reward is negligible vs
+# cut it ~75% to 0.002 so the spin's (low-align) speed reward is negligible vs
 # the progress/checkpoint reward from actually getting around the track. SAME
-# soft formula -- no hard align gate yet (one variable at a time; the gate is the
-# next lever if 0.002 still gets gamed).
-SPEED_WEIGHT = 0.002
+# soft formula. run5 nudges it 0.002 -> 0.003 (small anti-timidity bias toward
+# confident throttle now the heading gate forbids spinning for points); still a
+# nudge, far below run2's disastrous 0.0075.
+SPEED_WEIGHT = 0.003
 # Anti-wobble smoothing penalty (run2): run1 steered bang-bang left-right
 # because nothing penalized it. smoothness_penalty = -SMOOTH_WEIGHT *
 # abs(steer - prev_steer) penalizes the CHANGE in steering, not steering itself,
@@ -81,6 +82,19 @@ SMOOTH_WEIGHT = 0.1
 # separates them. spin_penalty = -SPIN_WEIGHT * max(0, slip - SLIP_DEADZONE).
 SLIP_DEADZONE = 2.0
 SPIN_WEIGHT = 0.05
+# Heading kill-switch (run5): the reward was heading-BLIND -- it gated on
+# velocity-vs-tangent but never on which way the nose points, so a spun-out car
+# sliding/coasting down-track earned full progress + speed + checkpoint reward
+# (the leak behind run4's spin-and-reverse). heading_align = dir.tangent (nose vs
+# track tangent, parallel to the existing velocity_align). When the nose points
+# more than ~90deg off down-track (heading_align < threshold) we ZERO the entire
+# step reward (progress, speed, AND checkpoint/lap bonuses) -- a kill-switch, not
+# a multiplier (a multiplier would tax legitimate corners where the nose is
+# naturally 10-30deg off). -0.2 gives margin so an extreme-but-recoverable slide
+# is not instantly zeroed. A genuine spin-out (sustained heading_align < -0.2)
+# also terminates the episode after BACKWARD_TERM_STEPS.
+HEADING_KILL_THRESHOLD = -0.2
+BACKWARD_TERM_STEPS = 40    # ~2 s at the 20 Hz env tick; resets when nose recovers
 # Monotonic progress tracker: each step we re-find the car's centerline index by
 # searching only a LOCAL window around the last index, never globally. This
 # keeps cumulative distance continuous across the start/finish seam (idx 0 and
@@ -242,6 +256,8 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._last_smoothness_penalty = 0.0
         self._last_slip = 0.0
         self._last_spin_penalty = 0.0
+        self._last_heading_align = 1.0   # nose vs tangent (run5 heading gate)
+        self._backward_steps = 0         # consecutive backward-facing steps
         # Steering smoothness tracker (run2): _cur_steer is this tick's steer,
         # _prev_steer last tick's; their difference drives smoothness_penalty.
         self._prev_steer = 0.0
@@ -362,6 +378,9 @@ class BeamNGRaceEnv(gymnasium.Env):
         # No prior action at spawn, so the first step has zero steering change.
         self._prev_steer = 0.0
         self._cur_steer = 0.0
+        # run5 heading gate: spawn faces down-track, no backward streak yet.
+        self._last_heading_align = 1.0
+        self._backward_steps = 0
         return self._get_observation(), {}
 
     def step(self, action):
@@ -404,6 +423,8 @@ class BeamNGRaceEnv(gymnasium.Env):
             "smoothness_penalty": float(self._last_smoothness_penalty),
             "slip": float(self._last_slip),
             "spin_penalty": float(self._last_spin_penalty),
+            "heading_align": float(self._last_heading_align),
+            "backward_steps": int(self._backward_steps),
             "checkpoints_reached": int(self._checkpoints_reached),
             "lap_completed": bool(self._lap_done),
         }
@@ -504,15 +525,50 @@ class BeamNGRaceEnv(gymnasium.Env):
         vel = s["vel"]
         speed_horizontal = math.sqrt(vel[0] ** 2 + vel[1] ** 2)
 
+        # Track tangent at the car's current centerline index, used by BOTH the
+        # velocity alignment and the run5 heading gate.
+        forward_yaw = self._smoothed_forward_yaw(self._progress_idx)
+        fx, fy = math.cos(forward_yaw), math.sin(forward_yaw)
+
         if speed_horizontal < STOPPED_SPEED_M_S:
             # No directional signal when essentially stopped — pin alignment
             # at 1.0 so a spun-out car can recover without losing reward.
             raw_alignment = 1.0
         else:
-            forward_yaw = self._smoothed_forward_yaw(self._progress_idx)
-            fx, fy = math.cos(forward_yaw), math.sin(forward_yaw)
             vx, vy = vel[0] / speed_horizontal, vel[1] / speed_horizontal
             raw_alignment = vx * fx + vy * fy   # signed, -1 to +1
+
+        # run5 HEADING gate: where the NOSE points (State["dir"]), not where it
+        # moves. heading_align = dir.tangent (parallel to velocity_align). dir is
+        # valid at any speed (no stopped-pin), so a slow backward-facing car is
+        # still caught -- closing the heading-blind leak (a spun car sliding
+        # down-track used to earn full reward).
+        fdir = s.get("dir", (fx, fy, 0.0))
+        hn = math.sqrt(fdir[0] ** 2 + fdir[1] ** 2)
+        heading_align = (fdir[0] * fx + fdir[1] * fy) / hn if hn > 1e-6 else 1.0
+        self._last_heading_align = heading_align
+        if heading_align < HEADING_KILL_THRESHOLD:
+            self._backward_steps += 1
+        else:
+            self._backward_steps = 0
+
+        # KILL-SWITCH: nose more than ~90deg off down-track -> ZERO the entire
+        # step reward (progress, speed, AND checkpoint/lap bonuses). The early
+        # return also means the checkpoint loop below never runs while backward,
+        # so the checkpoint bonus is heading-gated at the source.
+        if heading_align < HEADING_KILL_THRESHOLD:
+            self._prev_steer = self._cur_steer
+            wheelspeed = float(_shared["vehicle"].sensors["electrics"].get(
+                "wheelspeed", speed_horizontal))
+            self._last_raw_progress = raw_progress
+            self._last_raw_alignment = raw_alignment
+            self._last_final_reward = 0.0
+            self._last_speed_reward = 0.0
+            self._last_smoothness_penalty = 0.0
+            self._last_slip = wheelspeed - speed_horizontal
+            self._last_spin_penalty = 0.0
+            self._steps_since_progress += 1
+            return 0.0
 
         # Gate: clamp negative to zero so backward driving earns no reward.
         gated_alignment = max(0.0, raw_alignment)
@@ -573,8 +629,18 @@ class BeamNGRaceEnv(gymnasium.Env):
             return True, FLIP_PENALTY
         if self._is_off_track():
             return True, OFF_TRACK_PENALTY
-        if self._lap_done:   # set by _advance_progress on a genuine forward lap
+        # Lap bonus only counts when forward-facing (run5): _lap_done is position-
+        # based (seam crossing) and heading-blind, so gate it so a backward slide
+        # across the seam can never collect the +100.
+        if self._lap_done and self._last_heading_align >= HEADING_KILL_THRESHOLD:
             return True, LAP_BONUS
+        # Backward-facing termination (run5): a sustained spin-out (nose >~90deg
+        # off down-track for BACKWARD_TERM_STEPS in a row) ends the episode -- the
+        # heading gate already zeroes its reward; this makes the spin-out terminal
+        # (~2 s) instead of waiting out the 10 s stuck counter. Neutral terminal
+        # (no extra penalty; negative-backward penalty is held in reserve).
+        if self._backward_steps >= BACKWARD_TERM_STEPS:
+            return True, 0.0
         if self._steps_since_progress > STUCK_STEPS_THRESHOLD:
             return True, STUCK_PENALTY
         return False, 0.0
