@@ -115,6 +115,18 @@ def parse_args():
     p.add_argument("--no-journal", action="store_true",
                    help="Skip writing an entry to RUNS.md (useful for smoke "
                         "tests).")
+    p.add_argument("--warm-start", default=None,
+                   help="Path to a saved SAC .zip to warm-start from "
+                        "(SAC.load) instead of fresh init. Use --learning-rate "
+                        "and --learning-starts to control gentle continuation.")
+    p.add_argument("--learning-rate", type=float, default=3e-4,
+                   help="SAC learning rate. Lower (e.g. 1e-4) for warm-start "
+                        "fine-tuning so the loaded policy is nudged, not "
+                        "overwritten.")
+    p.add_argument("--learning-starts", type=int, default=1000,
+                   help="Random-action steps before learning. Set 0 for "
+                        "warm-start so the LOADED policy drives from step 0 "
+                        "(SAC takes random actions during these steps).")
     return p.parse_args()
 
 
@@ -156,6 +168,7 @@ def main():
     # not per-step — for true per-step CSV we'd need a custom callback.
     monitor_info_keys = ("raw_progress", "alignment", "final_reward",
                          "speed_reward", "smoothness_penalty",
+                         "slip", "spin_penalty",
                          "checkpoints_reached")
     train_env = Monitor(
         make_beamng_env(
@@ -176,16 +189,15 @@ def main():
         launch=False, headless=args.headless, nogpu=args.nogpu,
     )
 
-    # run3: SAC with SB3 sensible defaults for continuous control (no over-tuning
-    # yet -- defaults first). SAC is off-policy + sample-efficient, a better fit
-    # for this fine-motor control problem than PPO. buffer_size 1M holds the whole
-    # 500k run; learning_starts 1000 fills the replay buffer with random actions
-    # before learning (its early behavior looks random by design); ent_coef
-    # "auto" lets SAC tune its own exploration temperature.
+    # SAC with SB3 sensible defaults for continuous control. buffer_size 1M holds
+    # the whole 500k run; ent_coef "auto" self-tunes exploration. learning_rate
+    # and learning_starts come from args so a warm-start can lower the lr and set
+    # learning_starts=0. MlpPolicy SAC runs fine on CPU (the ~9-11 fps BeamNG env
+    # is the bottleneck, not the gradient step).
     hyperparams = dict(
-        learning_rate=3e-4,
+        learning_rate=args.learning_rate,
         buffer_size=1_000_000,
-        learning_starts=1000,
+        learning_starts=args.learning_starts,
         batch_size=256,
         tau=0.005,
         gamma=0.99,
@@ -193,16 +205,39 @@ def main():
         gradient_steps=1,
         ent_coef="auto",
     )
-    model = SAC(
-        "MlpPolicy",
-        train_env,
-        verbose=1,
-        tensorboard_log=str(log_dir),
-        # MlpPolicy SAC runs fine on CPU here; the BeamNG env (~9-11 fps) is the
-        # bottleneck, not the gradient step, so a GPU would not help.
-        device="cpu",
-        **hyperparams,
-    )
+    if args.warm_start:
+        # run4 warm-start: load a prior SAC policy and continue training it,
+        # rather than fresh init. custom_objects overrides BOTH learning_rate and
+        # lr_schedule (the schedule is what the optimizer reads each step, so the
+        # bare attribute is not enough); learning_starts and tensorboard_log pass
+        # as kwargs (SB3 load does model.__dict__.update(kwargs)). With
+        # learning_starts=0 the LOADED policy drives from step 0 instead of SAC's
+        # usual random-action warmup -- the proof the warm-start took.
+        if not os.path.isfile(args.warm_start):
+            raise SystemExit(f"--warm-start file not found: {args.warm_start}")
+        print(f"WARM-START: SAC.load({args.warm_start})  "
+              f"lr={args.learning_rate}  learning_starts={args.learning_starts}",
+              flush=True)
+        model = SAC.load(
+            args.warm_start,
+            env=train_env,
+            device="cpu",
+            custom_objects={
+                "learning_rate": args.learning_rate,
+                "lr_schedule": lambda _: args.learning_rate,
+            },
+            learning_starts=args.learning_starts,
+            tensorboard_log=str(log_dir),
+        )
+    else:
+        model = SAC(
+            "MlpPolicy",
+            train_env,
+            verbose=1,
+            tensorboard_log=str(log_dir),
+            device="cpu",
+            **hyperparams,
+        )
 
     eval_callback = EvalCallback(
         eval_env,

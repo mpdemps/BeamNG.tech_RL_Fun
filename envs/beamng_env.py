@@ -71,6 +71,16 @@ SPEED_WEIGHT = 0.002
 # abs(steer - prev_steer) penalizes the CHANGE in steering, not steering itself,
 # so smooth sustained cornering is free and only rapid flip-flopping costs.
 SMOOTH_WEIGHT = 0.1
+# Anti-wheelspin penalty (run4): punish burning the rear tyres off the line, the
+# traction root-cause under run3's spin-out variance. slip = wheelspeed (wheel-
+# rotation speed from Electrics) minus speed_horizontal (true ground speed); a
+# spinning wheel reads far faster than the car moves. Penalize only slip beyond a
+# deadzone so normal grip-slip and cornering are free and only genuine wheelspin
+# costs. Sensor-validated (scripts/wheelspin_probe*.py): clean cruise slip is
+# < 0.3 m/s, launch wheelspin is +5 to +14 m/s, so a 2.0 m/s deadzone cleanly
+# separates them. spin_penalty = -SPIN_WEIGHT * max(0, slip - SLIP_DEADZONE).
+SLIP_DEADZONE = 2.0
+SPIN_WEIGHT = 0.05
 # Monotonic progress tracker: each step we re-find the car's centerline index by
 # searching only a LOCAL window around the last index, never globally. This
 # keeps cumulative distance continuous across the start/finish seam (idx 0 and
@@ -230,6 +240,8 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._last_final_reward = 0.0
         self._last_speed_reward = 0.0
         self._last_smoothness_penalty = 0.0
+        self._last_slip = 0.0
+        self._last_spin_penalty = 0.0
         # Steering smoothness tracker (run2): _cur_steer is this tick's steer,
         # _prev_steer last tick's; their difference drives smoothness_penalty.
         self._prev_steer = 0.0
@@ -390,6 +402,8 @@ class BeamNGRaceEnv(gymnasium.Env):
             "final_reward": float(self._last_final_reward),
             "speed_reward": float(self._last_speed_reward),
             "smoothness_penalty": float(self._last_smoothness_penalty),
+            "slip": float(self._last_slip),
+            "spin_penalty": float(self._last_spin_penalty),
             "checkpoints_reached": int(self._checkpoints_reached),
             "lap_completed": bool(self._lap_done),
         }
@@ -515,11 +529,22 @@ class BeamNGRaceEnv(gymnasium.Env):
                                                   - self._prev_steer)
         self._prev_steer = self._cur_steer
 
+        # Anti-wheelspin penalty (run4): wheelspeed is the wheel-rotation speed
+        # (already polled via the Electrics sensor, just unused until now); when
+        # the rear tyres spin it reads far above the true ground speed. Penalize
+        # only the excess slip beyond the deadzone (see SLIP_DEADZONE/SPIN_WEIGHT).
+        wheelspeed = float(_shared["vehicle"].sensors["electrics"].get(
+            "wheelspeed", speed_horizontal))
+        slip = wheelspeed - speed_horizontal
+        spin_penalty = -SPIN_WEIGHT * max(0.0, slip - SLIP_DEADZONE)
+
         self._last_raw_progress = raw_progress
         self._last_raw_alignment = raw_alignment
         self._last_final_reward = final_reward
         self._last_speed_reward = speed_reward
         self._last_smoothness_penalty = smoothness_penalty
+        self._last_slip = slip
+        self._last_spin_penalty = spin_penalty
 
         if final_reward > 0.01:
             self._steps_since_progress = 0
@@ -537,10 +562,10 @@ class BeamNGRaceEnv(gymnasium.Env):
                 self._checkpoints_hit.add(k)
                 self._checkpoints_reached += 1
                 checkpoint_bonus += CHECKPOINT_BONUS
-        # Existing progress/checkpoint terms stay dominant; the speed and
-        # smoothness terms are the small run2 nudges layered on top.
+        # Existing progress/checkpoint terms stay dominant; the speed/smoothness
+        # nudges and the run4 wheelspin penalty layer on top.
         return float(final_reward + checkpoint_bonus
-                     + speed_reward + smoothness_penalty)
+                     + speed_reward + smoothness_penalty + spin_penalty)
 
     def _check_done(self) -> Tuple[bool, float]:
         """Did the episode end? If so, what bonus or penalty applies?"""
