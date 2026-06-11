@@ -99,10 +99,28 @@ If SAC + 0.002 speed works: the car drives controlled (no spin), the small speed
 reward prevents crawling, and it should progress through the track properly like
 run1 did, but on the race car and (via SAC) more sample-efficiently.
 
-Fallbacks if it STILL spins:
+Fallbacks if it STILL spins (run4 levers, introduce ONE at a time for clean
+attribution, do NOT stack):
+- Add a yaw-rate spin penalty: spin_penalty = -SPIN_WEIGHT * max(0,
+  abs(yaw_rate) - YAW_THRESHOLD). Threshold set HIGH so normal cornering (incl.
+  the 80km/h left) is free and only genuine spinning (sustained high rotation) is
+  penalized. This directly targets the donut's defining feature. Preferred first
+  fallback if SAC+0.002 still spins. (yaw_rate available from vehicle state/IMU.)
+- Alternative: slip-angle penalty (penalize heading-vs-velocity divergence, i.e.
+  car sideways). Note this is the OPPOSITE of the drift-phase reward; here we want
+  the nose pointed where it's going.
+- Strengthen the off-track penalty (already exists as a terminal ~-10; could
+  raise it, or add a graded dist-from-center penalty so the car learns to stay
+  centered continuously rather than only at the boundary cliff).
 - Add the hard align gate (speed only when align > 0.8) to deny the donut its
-  reward directly.
+  speed reward directly.
 - Strengthen SMOOTH_WEIGHT (penalize the donut's wild steering harder).
 - Accept the race car is spin-happy and better suited to the DRIFT phase (where
   breaking traction is a feature, not a bug) than to careful racing; consider
   run1's slower car for the lap goal.
+
+Note: off-track is ALREADY penalized (terminal ~-10). The donut problem is not
+that off-track is unpunished; it is that the spinner earned enough speed +
+progress + checkpoint reward BEFORE going off-track to outweigh it. SAC + the
+0.002 speed cut attack that root cause (remove the spin's reward source). The
+yaw-rate penalty is the targeted backup if the root-cause fix is not enough.
