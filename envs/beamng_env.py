@@ -55,15 +55,17 @@ LAP_BONUS = 100.0                   # jackpot for completing the lap (the goal)
 # final checkpoint is the finish line, rewarded by LAP_BONUS instead.
 N_CHECKPOINTS = 16
 CHECKPOINT_BONUS = 10.0
-# Anti-crawl speed reward (run2): pays for going fast, but only when on the
-# racing line and pointed forward. speed_reward = SPEED_WEIGHT * forward_speed *
+# Anti-crawl speed reward: pays for going fast, but only when on the racing line
+# and pointed forward. speed_reward = SPEED_WEIGHT * forward_speed *
 # gated_alignment, so a crawling-for-safe-points car earns less than one that
-# carries speed. Kept SMALL so progress/checkpoint rewards stay dominant: the
-# Scintilla tops out far faster than run1's etk800, so at ~70 m/s a weight of
-# 0.02 (the original sedan figure) would swamp the ~1-1.5/tick progress reward
-# and reward reckless flooring. 0.0075 caps the term near ~0.5/tick. Tune up
-# only if the car still crawls.
-SPEED_WEIGHT = 0.0075
+# carries speed. run2 (0.0075) was big enough that the powerful race car learned
+# to FLOOR-AND-SPIN: a donut still drifts forward across the evenly-spaced
+# checkpoints, and at 0.0075 the speed reward outweighed careful driving. run3
+# cuts it ~75% to 0.002 so the spin's (low-align) speed reward is negligible vs
+# the progress/checkpoint reward from actually getting around the track. SAME
+# soft formula -- no hard align gate yet (one variable at a time; the gate is the
+# next lever if 0.002 still gets gamed).
+SPEED_WEIGHT = 0.002
 # Anti-wobble smoothing penalty (run2): run1 steered bang-bang left-right
 # because nothing penalized it. smoothness_penalty = -SMOOTH_WEIGHT *
 # abs(steer - prev_steer) penalizes the CHANGE in steering, not steering itself,

@@ -1,9 +1,9 @@
 """
-Train a PPO agent to drive a lap on West Coast USA in BeamNG.tech.
+Train a SAC agent to drive a lap on West Coast USA in BeamNG.tech.
 
 Plain-language overview, Mikey:
 - The script opens BeamNG by itself, then puts the car in it.
-- The car tries to drive; the stable-baselines3 PPO algorithm learns from
+- The car tries to drive; the stable-baselines3 SAC algorithm learns from
   trial and error.
 - The best version of the car-brain gets saved automatically — not just
   the last one.
@@ -28,7 +28,7 @@ import datetime
 import os
 from pathlib import Path
 
-from stable_baselines3 import PPO
+from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import (
     BaseCallback, CheckpointCallback, EvalCallback)
 from stable_baselines3.common.monitor import Monitor
@@ -73,15 +73,11 @@ class MilestoneSnapshotCallback(BaseCallback):
         return True
 
 
-# PPO entropy coefficient. The dead-policy 250k G14 run used 0.01 (confirmed
-# from its saved overnight_v1 model), so 0.01 is the CONTROL BASELINE here, not
-# a known fix -- entropy already failed once at this value on the old reward.
-# Held constant so the curriculum (fixed-start + checkpoint rewards) is the only
-# intervention, letting any learning be attributed to the curriculum rather than
-# a hyperparameter change. If the policy still collapses at 0.01 with the
-# curriculum, THAT is the evidence to revisit this and other causes (learning
-# rate, alignment-gate reward clamping, observation scaling).
-ENT_COEF = 0.01
+# run3 switches PPO -> SAC. SAC tunes its entropy coefficient automatically
+# (ent_coef="auto", set in the hyperparams below), so there is no fixed entropy
+# constant to pin here as there was for PPO. SAC's entropy objective plus
+# off-policy replay tend toward controlled solutions rather than the degenerate
+# spin run2's PPO converged to.
 
 
 def parse_args():
@@ -180,34 +176,30 @@ def main():
         launch=False, headless=args.headless, nogpu=args.nogpu,
     )
 
-    # v1: PPO with the hyperparameters from docs/phase1_env_spec.md.
-    # TODO(v2 SAC migration): swap the next block for SAC for better sample
-    # efficiency on continuous control. Something like:
-    #   from stable_baselines3 import SAC
-    #   model = SAC("MlpPolicy", train_env,
-    #               learning_rate=3e-4, buffer_size=1_000_000,
-    #               learning_starts=1000, batch_size=256, tau=0.005,
-    #               gamma=0.99, train_freq=1, gradient_steps=1,
-    #               ent_coef="auto", tensorboard_log=str(log_dir),
-    #               device="cuda", verbose=1)
-    # Callbacks, learn(), and journaling below stay identical.
+    # run3: SAC with SB3 sensible defaults for continuous control (no over-tuning
+    # yet -- defaults first). SAC is off-policy + sample-efficient, a better fit
+    # for this fine-motor control problem than PPO. buffer_size 1M holds the whole
+    # 500k run; learning_starts 1000 fills the replay buffer with random actions
+    # before learning (its early behavior looks random by design); ent_coef
+    # "auto" lets SAC tune its own exploration temperature.
     hyperparams = dict(
         learning_rate=3e-4,
-        n_steps=2048,
-        batch_size=64,
-        n_epochs=10,
+        buffer_size=1_000_000,
+        learning_starts=1000,
+        batch_size=256,
+        tau=0.005,
         gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=ENT_COEF,
+        train_freq=1,
+        gradient_steps=1,
+        ent_coef="auto",
     )
-    model = PPO(
+    model = SAC(
         "MlpPolicy",
         train_env,
         verbose=1,
         tensorboard_log=str(log_dir),
-        # PPO with MlpPolicy is faster on CPU than GPU; GPU only helps for
-        # CNN policies. SB3 itself warns about this if you set device="cuda".
+        # MlpPolicy SAC runs fine on CPU here; the BeamNG env (~9-11 fps) is the
+        # bottleneck, not the gradient step, so a GPU would not help.
         device="cpu",
         **hyperparams,
     )
@@ -235,7 +227,7 @@ def main():
         model.learn(
             total_timesteps=args.timesteps,
             callback=[eval_callback, ckpt_callback, milestone_callback],
-            tb_log_name="ppo",
+            tb_log_name="sac",
         )
         completed_timesteps = model.num_timesteps
     except KeyboardInterrupt:

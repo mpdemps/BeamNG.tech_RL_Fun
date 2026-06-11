@@ -19,7 +19,7 @@ import sys
 for proc in ("BeamNG.tech.exe", "support.exe"):
     subprocess.run(["taskkill", "/F", "/IM", proc], capture_output=True)
 
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, SAC
 from envs.beamng_env import (
     make_beamng_env, _shared, MAX_SPEED_M_S, CENTER_OFFSET_CLIP_M,
     MAX_LOOKAHEAD_DIST_M, N_CHECKPOINTS, CHECKPOINT_BONUS, LAP_BONUS)
@@ -212,7 +212,24 @@ def main():
 
     # Visible window. No headless, no nogpu. We want to watch.
     env = make_beamng_env(home=BEAMNG_HOME, launch=True, headless=False, nogpu=False, random_spawn=False)
-    model = PPO.load(args.model, device="cpu")
+
+    # Load the policy without caring which algorithm trained it: run1/run2 are
+    # PPO, run3+ are SAC. Try each and use whichever loads cleanly, so this one
+    # watcher works for every run (the decisive G14 spin-check needs to load any
+    # snapshot). A mismatched algorithm raises on the policy structure, so the
+    # one that loads is the right one.
+    model, algo_name, _errs = None, None, {}
+    for _algo in (SAC, PPO):
+        try:
+            model = _algo.load(args.model, device="cpu")
+            algo_name = _algo.__name__
+            break
+        except Exception as e:
+            _errs[_algo.__name__] = repr(e)
+    if model is None:
+        print(f"ERROR: could not load {args.model} as SAC or PPO: {_errs}")
+        sys.exit(1)
+    print(f"Algorithm:    {algo_name} (auto-detected)")
 
     print("Ready. Ctrl+C to stop early.")
     print()
