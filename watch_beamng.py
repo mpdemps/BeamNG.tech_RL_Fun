@@ -22,7 +22,8 @@ for proc in ("BeamNG.tech.exe", "support.exe"):
 from stable_baselines3 import PPO, SAC
 from envs.beamng_env import (
     make_beamng_env, _shared, MAX_SPEED_M_S, CENTER_OFFSET_CLIP_M,
-    MAX_LOOKAHEAD_DIST_M, N_CHECKPOINTS, CHECKPOINT_BONUS, LAP_BONUS)
+    MAX_LOOKAHEAD_DIST_M, LOOKAHEAD_DISTANCES_M,
+    N_CHECKPOINTS, CHECKPOINT_BONUS, LAP_BONUS)
 
 DEFAULT_MODEL = "checkpoints/overnight_v1/best_model/best_model.zip"
 BEAMNG_HOME = r"C:\BeamNG\BeamNG.tech.v0.38.5.0"
@@ -92,11 +93,18 @@ def _turn_arrow(bearing):
 
 
 def _readout(obs, action):
-    """Return the 2-3 line live panel (what it sees + what it does)."""
+    """Return the 2-3 line live panel (what it sees + what it does).
+
+    Matches the run6 15-element obs: [speed, heading_err, center_off] + 6
+    lookahead points x (dist, bearing) at LOOKAHEAD_DISTANCES_M ahead. The ROAD
+    line shows exactly the points the policy sees (the old dashboard showed
+    different points than the observation, which misled us once). NOTE: pre-run6
+    models (9-element obs) cannot load against this env; to watch them, check
+    out the pre-run6 commit.
+    """
     speed, aligned, offset = float(obs[0]), float(obs[1]), float(obs[2])
-    d1, b1 = float(obs[3]), float(obs[4])
-    d2, b2 = float(obs[5]), float(obs[6])
-    d3, b3 = float(obs[7]), float(obs[8])
+    legs = [(float(obs[3 + 2 * i]), float(obs[4 + 2 * i]))
+            for i in range(len(LOOKAHEAD_DISTANCES_M))]
     steer, thr = float(action[0]), float(action[1])
 
     kmh = speed * MAX_SPEED_M_S * 3.6
@@ -104,12 +112,13 @@ def _readout(obs, action):
     track_word = "centered" if abs(offset) < 0.08 else ("left" if offset < 0 else "right")
 
     def leg(d, b):
-        return f"{_turn_arrow(b)}{d * MAX_LOOKAHEAD_DIST_M:3.0f}m"
+        return f"{_turn_arrow(b)}{d * MAX_LOOKAHEAD_DIST_M:3.0f}"
 
     sees = (f" SEES  speed[{_fill_bar(speed)}]{kmh:3.0f}km/h"
             f"  aligned[{_center_bar(aligned)}]{align_word:5s}"
             f"  on-track[{_center_bar(offset)}]{track_word}")
-    road = (f" ROAD  ahead:  {leg(d1, b1)}   {leg(d2, b2)}   {leg(d3, b3)}")
+    road = (" ROAD  ahead(m): "
+            + "  ".join(leg(d, b) for d, b in legs))
     steer_word = "straight" if abs(steer) < 0.08 else ("LEFT" if steer < 0 else "RIGHT")
     if thr >= 0:
         pedal = f"gas  [{_fill_bar(thr)}]{thr * 100:3.0f}%"

@@ -168,6 +168,7 @@ def main():
     # not per-step — for true per-step CSV we'd need a custom callback.
     monitor_info_keys = ("raw_progress", "alignment", "final_reward",
                          "speed_reward", "smoothness_penalty",
+                         "throttle_smooth_penalty",
                          "slip", "spin_penalty", "heading_align",
                          "checkpoints_reached")
     train_env = Monitor(

@@ -14,6 +14,7 @@ We follow the methodology in docs/phase1_env_spec.md. The rtgym wrapper
 step().
 """
 
+import bisect
 import math
 from typing import Optional, Tuple
 
@@ -37,7 +38,18 @@ VEHICLE_ID = "ego"
 PHYSICS_STEPS_PER_STEP = 3          # 3 steps at 60 Hz = 50 ms = 20 Hz env tick.
 DETERMINISTIC_STEPS_PER_S = 60
 MAX_SPEED_M_S = 70.0                # for obs normalization
-MAX_LOOKAHEAD_DIST_M = 200.0
+# Lookahead (run6 rebuild): the old observation looked at CENTERLINE[idx+1/2/3],
+# a ~13m horizon that SHRANK in corners (points cluster where the track curves).
+# At 1.395g braking, 13m of vision caps blind-safe speed near ~19 m/s -- the car
+# could never learn the straights at speed. New design: 6 points at FIXED ARC
+# DISTANCES ahead of the car's true arc position, sized for the car's POTENTIAL
+# (speed-profile peak ~77-78 m/s; worst-case braking ~215m) not historical
+# policy speed. Geometric spacing: dense near (placement), sparse far
+# (anticipation). 280m = worst-case braking sight + margin.
+LOOKAHEAD_DISTANCES_M = [10.0, 20.0, 40.0, 80.0, 160.0, 280.0]
+# Normalizer for the lookahead euclidean distances (euclidean <= arc <= 280, so
+# /300 spans ~0..0.93 and never clips).
+MAX_LOOKAHEAD_DIST_M = 300.0
 CENTER_OFFSET_CLIP_M = 10.0
 OFF_TRACK_THRESHOLD_M = 20.0        # generous; tighten once centerline is real
 STUCK_STEPS_THRESHOLD = 200
@@ -71,7 +83,21 @@ SPEED_WEIGHT = 0.003
 # because nothing penalized it. smoothness_penalty = -SMOOTH_WEIGHT *
 # abs(steer - prev_steer) penalizes the CHANGE in steering, not steering itself,
 # so smooth sustained cornering is free and only rapid flip-flopping costs.
-SMOOTH_WEIGHT = 0.1
+# run6 raises 0.1 -> 0.2: 0.1 did not bite (run5 still oscillated). A real
+# hairpin is a few large changes (affordable under this total-variation penalty)
+# vs continuous oscillation (accumulates), so a higher weight suppresses the
+# flutter without preventing genuine steering.
+SMOOTH_WEIGHT = 0.2
+# Anti-chatter throttle/brake smoothness (run6, PRIMARY fix): action[1] is the
+# combined throttle(+)/brake(-) axis, and its CHANGE was completely uncosted, so
+# run5 chattered gas<->brake (occasionally flooring into a corner -> spin). Same
+# total-variation form as steering: penalize abs(action[1] - prev). One term
+# covers throttle chatter, brake chatter, AND throttle<->brake flipping. Started
+# LOWER than steering (0.05): the car needs DECISIVE throttle/brake (floor on
+# exit, hard brake on entry) more than decisive steering, so over-penalizing this
+# axis is the most direct route to timidity. Raise toward 0.08-0.1 only if
+# chatter persists.
+THROTTLE_SMOOTH_WEIGHT = 0.05
 # Anti-wheelspin penalty (run4): punish burning the rear tyres off the line, the
 # traction root-cause under run3's spin-out variance. slip = wheelspeed (wheel-
 # rotation speed from Electrics) minus speed_horizontal (true ground speed); a
@@ -240,8 +266,11 @@ class BeamNGRaceEnv(gymnasium.Env):
         self.headless = headless
         self.nogpu = nogpu
 
+        # 15 = speed + heading_err + center_off + 6 lookahead points x (dist,
+        # bearing). NOTE: this shape change makes pre-run6 models unloadable
+        # against this env (watch old runs by checking out the pre-run6 commit).
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(9,), dtype=np.float32)
+            low=-1.0, high=1.0, shape=(15,), dtype=np.float32)
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
@@ -258,10 +287,14 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._last_spin_penalty = 0.0
         self._last_heading_align = 1.0   # nose vs tangent (run5 heading gate)
         self._backward_steps = 0         # consecutive backward-facing steps
+        self._last_throttle_smooth_penalty = 0.0
         # Steering smoothness tracker (run2): _cur_steer is this tick's steer,
         # _prev_steer last tick's; their difference drives smoothness_penalty.
+        # run6 adds the same for throttle/brake (action[1]).
         self._prev_steer = 0.0
         self._cur_steer = 0.0
+        self._prev_throttle = 0.0
+        self._cur_throttle = 0.0
 
         # Cumulative arc length from CENTERLINE[0] to each index, plus the
         # full-loop track length. The monotonic progress tracker uses these.
@@ -375,9 +408,12 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._steps_since_progress = 0
         self._checkpoints_hit = set()
         self._checkpoints_reached = 0
-        # No prior action at spawn, so the first step has zero steering change.
+        # No prior action at spawn, so the first step has zero steering/throttle
+        # change.
         self._prev_steer = 0.0
         self._cur_steer = 0.0
+        self._prev_throttle = 0.0
+        self._cur_throttle = 0.0
         # run5 heading gate: spawn faces down-track, no backward streak yet.
         self._last_heading_align = 1.0
         self._backward_steps = 0
@@ -390,6 +426,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         steer = float(np.clip(action[0], -1.0, 1.0))
         self._cur_steer = steer   # read by _compute_reward's smoothness penalty
         thr = float(np.clip(action[1], -1.0, 1.0))
+        self._cur_throttle = thr  # read by _compute_reward's throttle-smoothness
         throttle = max(0.0, thr)
         brake = max(0.0, -thr)
         _shared["vehicle"].control(steering=steer, throttle=throttle,
@@ -421,6 +458,7 @@ class BeamNGRaceEnv(gymnasium.Env):
             "final_reward": float(self._last_final_reward),
             "speed_reward": float(self._last_speed_reward),
             "smoothness_penalty": float(self._last_smoothness_penalty),
+            "throttle_smooth_penalty": float(self._last_throttle_smooth_penalty),
             "slip": float(self._last_slip),
             "spin_penalty": float(self._last_spin_penalty),
             "heading_align": float(self._last_heading_align),
@@ -470,37 +508,70 @@ class BeamNGRaceEnv(gymnasium.Env):
         raw = math.atan2(next_pt[1] - prev_pt[1], next_pt[0] - prev_pt[0])
         return raw + math.radians(SPAWN_YAW_BIAS_DEG)
 
+    def _point_at_arc(self, arc: float):
+        """The (x, y, z) point at arc-position `arc` along the centerline loop.
+
+        Binary-searches the precomputed cumulative-arc array, then LINEARLY
+        INTERPOLATES between the two bracketing centerline points. Interpolation
+        (not snap-to-nearest) matters: segment spacing reaches 27.8 m on the
+        sparse straights, so snapping would put up to ~14 m of error on the 10 m
+        near point. Wraps the start/finish seam via modulo (read-only on the
+        cum-arc machinery; cannot disturb lap counting).
+        """
+        n = len(CENTERLINE)
+        arc = arc % self._track_length
+        if arc >= self._cum_arc[n - 1]:
+            # Closing segment: last point -> first point across the seam.
+            a, b = CENTERLINE[n - 1], CENTERLINE[0]
+            seg = self._track_length - self._cum_arc[n - 1]
+            frac = (arc - self._cum_arc[n - 1]) / seg if seg > 1e-9 else 0.0
+        else:
+            i = bisect.bisect_right(self._cum_arc, arc) - 1
+            a, b = CENTERLINE[i], CENTERLINE[i + 1]
+            seg = self._cum_arc[i + 1] - self._cum_arc[i]
+            frac = (arc - self._cum_arc[i]) / seg if seg > 1e-9 else 0.0
+        return (a[0] + frac * (b[0] - a[0]),
+                a[1] + frac * (b[1] - a[1]),
+                a[2] + frac * (b[2] - a[2]))
+
     def _get_observation(self) -> np.ndarray:
-        """Pack the 9 numbers the AI sees this tick."""
+        """Pack the 15 numbers the AI sees this tick."""
         s = _shared["vehicle"].sensors["agent_state"]
         pos = s["pos"]
         vel = s["vel"]
         forward = s.get("dir", (1.0, 0.0, 0.0))
         speed = math.sqrt(vel[0] ** 2 + vel[1] ** 2 + vel[2] ** 2)
 
-        # Use the monotonic tracker's index (not a global nearest search) so the
-        # lookahead the policy sees matches the forward progress it's rewarded
-        # for -- consistent across the start/finish seam.
+        # Anchor at the car's TRUE arc position (cum_arc[idx] + projection along
+        # the current segment), NOT cum_arc[idx] alone: segments reach 27.8 m on
+        # the sparse straights, so anchoring at the index could resolve the 10 m
+        # near point BEHIND the car. _cur_centerline_dist already carries the
+        # exact value (laps absorbed by the modulo). Read-only on the seam-safe
+        # cum-arc machinery -- consistent with the progress the car is rewarded
+        # for, never a global nearest search.
+        anchor = self._cur_centerline_dist % self._track_length
+        look_pts = [self._point_at_arc(anchor + d_ahead)
+                    for d_ahead in LOOKAHEAD_DISTANCES_M]
+
+        # heading_err aims at the 10 m near point (pure-pursuit style aim).
+        # center_off stays on the LOCAL idx->idx+1 segment: it is a lateral
+        # placement signal at the car's position, and a 10 m chord would pick up
+        # ~0.8 m of false offset (sagitta) in the R15 hairpin.
         idx = self._progress_idx
         c_curr = CENTERLINE[idx]
-        c1 = CENTERLINE[(idx + 1) % len(CENTERLINE)]
-        c2 = CENTERLINE[(idx + 2) % len(CENTERLINE)]
-        c3 = CENTERLINE[(idx + 3) % len(CENTERLINE)]
+        c_next = CENTERLINE[(idx + 1) % len(CENTERLINE)]
+        heading_err = _bearing_to(forward, pos, look_pts[0])
+        center_off = _perp_distance(pos, c_curr, c_next)
 
-        heading_err = _bearing_to(forward, pos, c1)
-        center_off = _perp_distance(pos, c_curr, c1)
-
-        obs = np.array([
+        vals = [
             speed / MAX_SPEED_M_S,
             heading_err / math.pi,
             np.clip(center_off / CENTER_OFFSET_CLIP_M, -1.0, 1.0),
-            _dist(pos, c1) / MAX_LOOKAHEAD_DIST_M,
-            _bearing_to(forward, pos, c1) / math.pi,
-            _dist(pos, c2) / MAX_LOOKAHEAD_DIST_M,
-            _bearing_to(forward, pos, c2) / math.pi,
-            _dist(pos, c3) / MAX_LOOKAHEAD_DIST_M,
-            _bearing_to(forward, pos, c3) / math.pi,
-        ], dtype=np.float32)
+        ]
+        for p in look_pts:
+            vals.append(_dist(pos, p) / MAX_LOOKAHEAD_DIST_M)
+            vals.append(_bearing_to(forward, pos, p) / math.pi)
+        obs = np.array(vals, dtype=np.float32)
         return np.clip(obs, -1.0, 1.0)
 
     def _compute_reward(self) -> float:
@@ -558,6 +629,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         # so the checkpoint bonus is heading-gated at the source.
         if heading_align < HEADING_KILL_THRESHOLD:
             self._prev_steer = self._cur_steer
+            self._prev_throttle = self._cur_throttle
             wheelspeed = float(_shared["vehicle"].sensors["electrics"].get(
                 "wheelspeed", speed_horizontal))
             self._last_raw_progress = raw_progress
@@ -565,6 +637,7 @@ class BeamNGRaceEnv(gymnasium.Env):
             self._last_final_reward = 0.0
             self._last_speed_reward = 0.0
             self._last_smoothness_penalty = 0.0
+            self._last_throttle_smooth_penalty = 0.0
             self._last_slip = wheelspeed - speed_horizontal
             self._last_spin_penalty = 0.0
             self._steps_since_progress += 1
@@ -585,6 +658,14 @@ class BeamNGRaceEnv(gymnasium.Env):
                                                   - self._prev_steer)
         self._prev_steer = self._cur_steer
 
+        # Anti-chatter penalty (run6): same form on the throttle/brake axis
+        # (action[1]). Penalizes the CHANGE, so a smooth ramp or one deliberate
+        # gas->brake transition is cheap but high-frequency gas<->brake flutter
+        # accumulates. Covers throttle chatter, brake chatter, and zero-crossing.
+        throttle_smooth_penalty = -THROTTLE_SMOOTH_WEIGHT * abs(
+            self._cur_throttle - self._prev_throttle)
+        self._prev_throttle = self._cur_throttle
+
         # Anti-wheelspin penalty (run4): wheelspeed is the wheel-rotation speed
         # (already polled via the Electrics sensor, just unused until now); when
         # the rear tyres spin it reads far above the true ground speed. Penalize
@@ -599,6 +680,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._last_final_reward = final_reward
         self._last_speed_reward = speed_reward
         self._last_smoothness_penalty = smoothness_penalty
+        self._last_throttle_smooth_penalty = throttle_smooth_penalty
         self._last_slip = slip
         self._last_spin_penalty = spin_penalty
 
@@ -619,9 +701,10 @@ class BeamNGRaceEnv(gymnasium.Env):
                 self._checkpoints_reached += 1
                 checkpoint_bonus += CHECKPOINT_BONUS
         # Existing progress/checkpoint terms stay dominant; the speed/smoothness
-        # nudges and the run4 wheelspin penalty layer on top.
-        return float(final_reward + checkpoint_bonus
-                     + speed_reward + smoothness_penalty + spin_penalty)
+        # nudges, wheelspin penalty, and run6 throttle-smoothness layer on top.
+        return float(final_reward + checkpoint_bonus + speed_reward
+                     + smoothness_penalty + throttle_smooth_penalty
+                     + spin_penalty)
 
     def _check_done(self) -> Tuple[bool, float]:
         """Did the episode end? If so, what bonus or penalty applies?"""
