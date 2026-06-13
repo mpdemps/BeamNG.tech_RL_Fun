@@ -121,6 +121,17 @@ SPIN_WEIGHT = 0.05
 # also terminates the episode after BACKWARD_TERM_STEPS.
 HEADING_KILL_THRESHOLD = -0.2
 BACKWARD_TERM_STEPS = 40    # ~2 s at the 20 Hz env tick; resets when nose recovers
+# Price the backward exit (run7). run6 shipped this termination as a NEUTRAL
+# terminal (0.0) while every other death cost something (off-track -10, stuck
+# -5, flip -10) -- and the policy measurably converged onto the one free door:
+# backward-endings CLIMBED 51% -> 88% over training, 86% of them at 50-150m on
+# the opening straight (harvest ~100m of progress, then exit free). -25 makes
+# it deliberately the WORST death on the menu, because it is the door the
+# policy actually uses. Felt at spin onset as -25 * 0.99^40 ~ -16.7, decisively
+# below even a crawler's continuation value (~+20); NOT larger than -25 because
+# terminal fear generalizes to nearby fast-approach states (timidity is the
+# other observed failure mode) and -25 stays within the critic's target scale.
+BACKWARD_TERM_PENALTY = -25.0
 # Monotonic progress tracker: each step we re-find the car's centerline index by
 # searching only a LOCAL window around the last index, never globally. This
 # keeps cumulative distance continuous across the start/finish seam (idx 0 and
@@ -288,6 +299,19 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._last_heading_align = 1.0   # nose vs tangent (run5 heading gate)
         self._backward_steps = 0         # consecutive backward-facing steps
         self._last_throttle_smooth_penalty = 0.0
+        # run7 instrumentation (pure logging, no reward-path effect): why the
+        # episode ended, plus per-episode aggregates for diagnosing timidity
+        # (mean speed), near-spins that were caught (recovered_count, min
+        # heading), wheelspin frequency (max slip), and exact death location
+        # (max arc) without re-deriving them from reward arithmetic.
+        self._last_term_reason = "run"
+        self._recovered_count = 0
+        self._dip_steps = 0              # consecutive steps heading < -0.2
+        self._ep_steps = 0
+        self._speed_sum = 0.0
+        self._max_arc = 0.0
+        self._min_heading_align = 1.0
+        self._max_slip = 0.0
         # Steering smoothness tracker (run2): _cur_steer is this tick's steer,
         # _prev_steer last tick's; their difference drives smoothness_penalty.
         # run6 adds the same for throttle/brake (action[1]).
@@ -417,6 +441,15 @@ class BeamNGRaceEnv(gymnasium.Env):
         # run5 heading gate: spawn faces down-track, no backward streak yet.
         self._last_heading_align = 1.0
         self._backward_steps = 0
+        # run7 instrumentation: fresh episode aggregates.
+        self._last_term_reason = "run"
+        self._recovered_count = 0
+        self._dip_steps = 0
+        self._ep_steps = 0
+        self._speed_sum = 0.0
+        self._max_arc = 0.0
+        self._min_heading_align = 1.0
+        self._max_slip = 0.0
         return self._get_observation(), {}
 
     def step(self, action):
@@ -465,6 +498,13 @@ class BeamNGRaceEnv(gymnasium.Env):
             "backward_steps": int(self._backward_steps),
             "checkpoints_reached": int(self._checkpoints_reached),
             "lap_completed": bool(self._lap_done),
+            # run7 instrumentation (Monitor logs the final step's values).
+            "termination_reason": str(self._last_term_reason),
+            "recovered_count": int(self._recovered_count),
+            "mean_speed": float(self._speed_sum / max(self._ep_steps, 1)),
+            "max_arc": float(self._max_arc),
+            "min_heading_align": float(self._min_heading_align),
+            "max_slip": float(self._max_slip),
         }
         return obs, reward + term_bonus, terminated, truncated, info
 
@@ -623,6 +663,28 @@ class BeamNGRaceEnv(gymnasium.Env):
         else:
             self._backward_steps = 0
 
+        # run7 instrumentation (logging only). A "recovery" = a genuine dip
+        # (>= 3 consecutive steps below the kill threshold) that ends with the
+        # nose back above ZERO -- the hysteresis stops boundary wobble at -0.2
+        # from inflating the count. Plus per-episode aggregates: mean speed
+        # (timidity trend), max arc (exact death location), min heading, and
+        # max slip (wheelspin frequency), all readable from the monitor CSV.
+        if heading_align < HEADING_KILL_THRESHOLD:
+            self._dip_steps += 1
+        elif heading_align >= 0.0:
+            if self._dip_steps >= 3:
+                self._recovered_count += 1
+            self._dip_steps = 0
+        self._ep_steps += 1
+        self._speed_sum += speed_horizontal
+        # Furthest forward arc distance reached (death-location proxy). Use the
+        # raw cumulative distance, NOT % track_length: a backward drift across
+        # the start seam makes _cur_centerline_dist slightly negative (laps=-1),
+        # which the running max() ignores -- whereas the modulo would wrap it to
+        # ~4361 and falsely read as a completed lap.
+        self._max_arc = max(self._max_arc, self._cur_centerline_dist)
+        self._min_heading_align = min(self._min_heading_align, heading_align)
+
         # KILL-SWITCH: nose more than ~90deg off down-track -> ZERO the entire
         # step reward (progress, speed, AND checkpoint/lap bonuses). The early
         # return also means the checkpoint loop below never runs while backward,
@@ -639,6 +701,7 @@ class BeamNGRaceEnv(gymnasium.Env):
             self._last_smoothness_penalty = 0.0
             self._last_throttle_smooth_penalty = 0.0
             self._last_slip = wheelspeed - speed_horizontal
+            self._max_slip = max(self._max_slip, self._last_slip)
             self._last_spin_penalty = 0.0
             self._steps_since_progress += 1
             return 0.0
@@ -673,6 +736,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         wheelspeed = float(_shared["vehicle"].sensors["electrics"].get(
             "wheelspeed", speed_horizontal))
         slip = wheelspeed - speed_horizontal
+        self._max_slip = max(self._max_slip, slip)
         spin_penalty = -SPIN_WEIGHT * max(0.0, slip - SLIP_DEADZONE)
 
         self._last_raw_progress = raw_progress
@@ -707,25 +771,36 @@ class BeamNGRaceEnv(gymnasium.Env):
                      + spin_penalty)
 
     def _check_done(self) -> Tuple[bool, float]:
-        """Did the episode end? If so, what bonus or penalty applies?"""
+        """Did the episode end? If so, what bonus or penalty applies?
+
+        Also records the termination reason (run7 instrumentation) so the
+        monitor CSV logs WHY each episode ended instead of leaving it to be
+        inferred from final-step heading_align.
+        """
         if self._is_flipped():
+            self._last_term_reason = "flip"
             return True, FLIP_PENALTY
         if self._is_off_track():
+            self._last_term_reason = "off_track"
             return True, OFF_TRACK_PENALTY
         # Lap bonus only counts when forward-facing (run5): _lap_done is position-
         # based (seam crossing) and heading-blind, so gate it so a backward slide
         # across the seam can never collect the +100.
         if self._lap_done and self._last_heading_align >= HEADING_KILL_THRESHOLD:
+            self._last_term_reason = "lap"
             return True, LAP_BONUS
-        # Backward-facing termination (run5): a sustained spin-out (nose >~90deg
-        # off down-track for BACKWARD_TERM_STEPS in a row) ends the episode -- the
-        # heading gate already zeroes its reward; this makes the spin-out terminal
-        # (~2 s) instead of waiting out the 10 s stuck counter. Neutral terminal
-        # (no extra penalty; negative-backward penalty is held in reserve).
+        # Backward-facing termination (run5 rule, run7 price): a sustained
+        # spin-out (nose >~90deg off down-track for BACKWARD_TERM_STEPS in a
+        # row) ends the episode at BACKWARD_TERM_PENALTY. run6 left this door
+        # free (0.0) and the policy converged onto it; see the constant's
+        # comment for the economics.
         if self._backward_steps >= BACKWARD_TERM_STEPS:
-            return True, 0.0
+            self._last_term_reason = "backward"
+            return True, BACKWARD_TERM_PENALTY
         if self._steps_since_progress > STUCK_STEPS_THRESHOLD:
+            self._last_term_reason = "stuck"
             return True, STUCK_PENALTY
+        self._last_term_reason = "run"
         return False, 0.0
 
     def _advance_progress(self, pos) -> None:

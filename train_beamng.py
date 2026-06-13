@@ -170,7 +170,10 @@ def main():
                          "speed_reward", "smoothness_penalty",
                          "throttle_smooth_penalty",
                          "slip", "spin_penalty", "heading_align",
-                         "checkpoints_reached")
+                         "checkpoints_reached",
+                         "termination_reason", "recovered_count",
+                         "mean_speed", "max_arc", "min_heading_align",
+                         "max_slip")
     train_env = Monitor(
         make_beamng_env(
             # Curriculum: fixed start at the start/finish line (idx=0) every
