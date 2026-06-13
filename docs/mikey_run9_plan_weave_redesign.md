@@ -1,12 +1,17 @@
 # run9 plan: weave penalty redesign (oscillation signature, not position)
 
-Date: 2026-06-13
-Status: DRAFT for CC review (poke holes against real env code + the run8 trace).
-Do not implement yet. Chat drafts, CC redesigns/validates, Mike approves, CC smokes,
-Mike approves the run.
+Date: 2026-06-13 (updated after CC's offline validation overturned the first form)
+Status: APPROVED design, one offline refinement pending before build (CC to lock N
+and the trigger), then build -> probe -> smoke -> fresh 500k on Mike's approval.
 
-Depends on: `docs/mikey_run8_postwatch_weave_diagnostic.md` and CC's per-step trace
-`logs/run8_weave_trace.csv`.
+Depends on: `docs/mikey_run8_postwatch_weave_diagnostic.md`, CC's per-step trace
+`logs/run8_weave_trace.csv`, and CC's offline study `scripts/run9_weave_redesign_offline.py`.
+
+Scope note: run9 is the STRAIGHT-ONLY weave fix. It suppresses the snake on the
+straight and stays cost-free in corners (the failure we have watched twice is a
+straight weave that spins the car before it ever reaches the corner). Positive
+good-line shaping through corners is the RACING LINE work, deferred to run10 (see
+section 8), which will subsume the geometry gate entirely.
 
 ---
 
@@ -17,129 +22,130 @@ an oscillation, and the oscillation moves the car through exactly the off-line
 positions that open the `on_line` gate. CC's trace: the car rides a steady ~2.2m
 offset and swings to 3.0-3.4m, so `on_line` sits near zero (mean 0.34) and the
 penalty never bites (mean -0.003 across the whole 80->115 kph weave-into-spin).
-`straightness` finishes the kill past ~235m where the 80m horizon pulls R40 into
-view. Two leaks, same root: we gated the penalty on the car's position, and the
-weave lives in the positions that disable it.
-
-Watched at resume-180k (~245k training age): still oscillating into a slide. The
-policy is not self-correcting; it reaches 484m by bulling through, not by driving
-straight. So this is a reward-form problem, confirmed twice (115k and 180k watches).
+`straightness` (80m horizon) finished the kill past ~235m where R40 enters view.
+Confirmed by two G14 watches (rolling_115000 and rolling_180000, ~245k training
+age): still oscillating into a slide; the policy is not self-correcting.
 
 ## 2. The core invariant the redesign must satisfy
 
-Distinguish a WEAVE from a legitimate RECOVERY by their shape, never by absolute
-position:
+Distinguish a WEAVE from a legitimate RECOVERY by their shape, never by position:
 
-- A weave is OSCILLATING lateral motion: center_off snakes back and forth, lateral
-  velocity keeps reversing sign. This is what we penalize.
-- A recovery (drift-back) is MONOTONIC: the car steers one way and |center_off|
-  decreases steadily toward the line. This must stay unpenalized. This is the case
-  `on_line` was trying to protect, and the reason we cannot just delete the gate and
-  penalize raw |steer|.
-- A corner is also (mostly) monotonic lateral motion plus sustained held steer, and
-  is handled by the straightness gate (penalty off when the road bends).
+- A weave is OSCILLATING lateral motion: center_off snakes, lateral velocity keeps
+  reversing sign. This is what we penalize.
+- A recovery (drift-back) is MONOTONIC: one-way, |center_off| decreasing toward the
+  line. Must stay unpenalized. This is what `on_line` was trying to protect, and the
+  reason we cannot just delete the gate and penalize raw |steer|.
+- A corner is handled by the straightness gate (penalty off when the road bends).
 
 So: penalize lateral oscillation, gated by straightness only. No position gate.
 
-## 3. Proposed form (primary candidate)
+## 3. The form (CC's V4, after the first form failed)
 
-Penalize the reversal of lateral motion, scaled by its magnitude, on straights.
+The first proposed form multiplied the penalty by `reversed` (fire only on the
+sign-flip step). CC's trace proved it dead (-0.002, 3 firings in 69 steps): the
+sign-flip is the turning point of the swing, where |lateral_vel| is at its MINIMUM,
+so the deadband ate nearly every firing. Charging at the reversal instant samples
+exactly the wrong moment. Fix: charge the swing while oscillation is ACTIVE, not at
+the reversal.
+
+Locked form (one offline refinement pending, see section 6 step 0):
 
 ```
-lateral_vel   = (center_off - prev_center_off)        # per step (dt constant at 20Hz)
-reversed      = sign(lateral_vel) != sign(prev_lateral_vel)
-swing         = max(0, |lateral_vel| - LAT_DEAD)      # deadband kills noise/micro
-weave_penalty = -WEAVE_WEIGHT * swing * reversed * straightness
+lateral_vel     = center_off - prev_center_off          # per 20Hz step; center_off is pose-independent geometry
+reversal        = (lateral_vel and prev_lateral_vel nonzero) and sign(lateral_vel) != sign(prev_lateral_vel)
+osc_active      = (>= 2 reversals in the last WEAVE_OSC_WINDOW steps)   # genuine oscillation, not a single correction
+swing           = max(0, |lateral_vel| - WEAVE_LAT_DEAD)
+weave_penalty   = -WEAVE_WEIGHT * swing * osc_active * straightness
+# straightness from centerline bend over WEAVE_LOOK_M (BEND_DEAD 3deg / BEND_FULL 15deg, unchanged)
 ```
 
 Why this is robust:
 - Pose-independent: center_off is centerline geometry, not nose-contaminated.
-- Outcome-based: it penalizes the snaking PATH, not a control input, so it cannot
-  be dodged by any steering trick. To avoid the penalty the car must stop snaking.
-- Frequency-robust (run7's failure): a slow weave still reverses; each reversal is
-  charged by amplitude, so it cannot hide in low frequency.
-- Position-robust (run8's failure): no `on_line` term, so going off-line does not
-  disable it. The steady 2.2m offset produces ~0 lateral velocity, so it is not
-  penalized (we do not care that the car is off-center, only that it snakes).
-- Recovery-safe: a monotonic drift-back has no sign reversals, so `reversed` = 0 and
-  it is unpenalized, replacing what `on_line` was meant to do.
+- Outcome-based: penalizes the snaking PATH, not a control input. To avoid it the
+  car must stop snaking; no steering trick dodges it.
+- Frequency-robust (run7's failure): a slow weave still reverses; charged by
+  amplitude per step while active, so it cannot hide in low frequency.
+- Position-robust (run8's failure): no `on_line`. Going off-line does not disable it.
+  The steady 2.2m offset has ~0 lateral velocity, so it is free (we do not care that
+  the car is off-center, only that it snakes).
+- Recovery-safe AND timidity-safe: a monotonic drift-back has zero reversals, and a
+  single isolated correction has exactly ONE reversal, so neither reaches the "2+
+  reversals" trigger. Only genuine oscillation (>=2 reversals per cycle) fires. This
+  replaces what `on_line` was for, without the leak, and without taxing legitimate
+  single corrections.
 
-Alternate candidate (for CC to weigh against the trace): penalize steering-direction
-reversals (sign flips of steer beyond a deadband) instead of lateral-velocity
-reversals. Steering is the cause, center_off is the effect; the effect is the safer
-target because it is what we actually want gone and it ignores corrective steering
-that does not produce snaking. CC: pick the one that fires cleanly across the trace
-weave and stays ~0 on a held-line straight and a real corner.
+## 4. The straightness-gate fix (H2), validated
 
-## 4. The straightness-gate fix (H2, do not inherit it)
+`WEAVE_LOOK_M` 80 -> 40. CC validated across all 18 detected corners: at 40m the gate
+stays LIVE through the entire 180-270m spin zone and releases at ~271m, 24m before
+R40 entry (apex 335m), leaving turn-in room. At 80m it released at 231m, deep in the
+spin zone (the measured leak). Across all 18 corners the 40m apex-lead is >=34m
+(mostly 40-160m), erring early (generous) for sharp/fast corners, which is the safe
+direction (does not tax legitimate setup).
 
-The current straightness gate uses an 80m horizon, which releases the penalty from
-~235m onward. The spins cluster at 180-280m, so the gate is OFF exactly where the
-weave is worst. Whatever signal we choose, if it is gated by straightness we must
-fix this.
+## 5. The logging fix (H3)
 
-Tension to resolve (CC's geometry call): the gate must release early enough to allow
-legitimate corner setup (a good driver turns in before the geometric corner) but
-stay ON through the back of the straight where the weave spins the car. R40 is at
-~300m; the legit turn-in zone is roughly the last 30-50m. A shorter straightness
-horizon (start point ~30-40m vs 80m) would keep the penalty live to ~260-270m and
-release just before turn-in. CC: validate the chosen horizon against ALL corner
-types (the R252 kink and faster corners may need earlier release than R40), using
-the measured geometry, so we do not start penalizing legitimate high-speed setup.
+CSV column 10 logged the terminal-step weave_penalty, which the heading kill-switch
+forces to 0 on every spin, so the CSV read ~0 and hid the failure all run.
+Accumulate `_weave_sum += weave_penalty` each step and log
+`info["weave_penalty"] = _weave_sum / max(_ep_steps, 1)` (episode mean). Monitor
+already logs that key, so the CSV column auto-switches to the mean bite. Next run the
+CSV alone tells us whether it is biting, no instrumented rollout needed.
 
-## 5. The logging fix (H3, so we are not blind again)
+## 6. Validation plan
 
-CSV column 10 logs the terminal-step weave_penalty, which the heading kill-switch
-forces to 0 on every spin, so the CSV read ~0 and hid the failure for the whole run.
-Change the per-episode weave_penalty logging to an episode MEAN (or sum) over steps,
-captured before the kill-switch zeroing, so next time the CSV actually tells us
-whether the penalty is biting without needing a full instrumented rollout.
-
-## 6. Validation plan (same rigor as run8)
-
-1. Re-run CC's instrumentation on `run8_weave_trace.csv` (or a fresh deterministic
-   rollout) with the NEW term computed offline. It must show a strongly negative
-   penalty across the 120-280m weave (not the current -0.003), i.e. it would have
-   bitten the behavior we watched.
-2. Probe (synthetic): the new term fires on an oscillating path; reads ~0 on a
-   straight held line at a steady offset; reads ~0 on a monotonic drift-back
-   recovery; reads ~0 through a real corner (straightness gate). Confirm no
-   intermittent unlock and bounded magnitude.
-3. Smoke (~7k fresh): term fires live, all run7/run8 mechanics intact (-25 backward,
-   kill-switch, wheelspin, lookahead), bounded, no NaN, logging shows the new
-   episode-mean weave column.
-4. One change only: this replaces the old position-gated weave term. Nothing else
-   moves.
+0. (refinement, offline, BEFORE build) Measure the inter-reversal spacing of the
+   weave in the trace; set WEAVE_OSC_WINDOW = N to span ~one weave cycle (so 2
+   reversals fall inside). Switch the trigger to ">=2 reversals in last N." Confirm
+   the new form still bites the trace weave hard (vs V4's -0.085) and that all
+   control cases below stay clean.
+1. Offline over the trace: penalty strongly negative across the 120-280m weave (not
+   -0.003); it would have bitten what we watched.
+2. Control cases, all must read ~0: held line at a steady 2.2m offset; monotonic
+   drift-back 3->0m; a real corner (straightness 0); AND a single isolated lateral
+   correction (one reversal, then settle) -> this is the timidity check.
+   The oscillating weave (the disease) must fire hard.
+3. Probe (synthetic) + ~7k fresh smoke: term fires live, episode-mean weave column
+   populated, all run7/run8 mechanics intact (-25 backward, kill-switch, wheelspin,
+   lookahead), bounded, no NaN.
+4. One change only: replaces the old position-gated weave term. Nothing else moves.
 
 ## 7. Risks to watch on the G14 (after it trains)
 
-- Steering timidity / understeer: if the deadband is too tight or the weight too
-  high, the car may stop making legitimate micro-corrections. Watch for a car that
-  refuses to adjust and washes wide.
-- Over-suppression into a new escape: confirm the policy does not learn a new proxy
-  (e.g. crawling so lateral_vel stays under the deadband). Speed on the straight
-  must stay real pace.
+- Steering timidity / understeer: addressed by construction via the 2-reversal
+  trigger, but still watch for a car that refuses to adjust and washes wide.
+- New escape proxy: confirm the policy does not learn to crawl so |lateral_vel|
+  stays under LAT_DEAD; straight speed must stay real pace.
+- WEAVE_WEIGHT magnitude: the -0.085 mean bite is ~6% of per-step progress, in the
+  same ballpark as the old "nearly free" 5% TV penalty. Treat 3.0 as a FLOOR; watch
+  whether behavior actually changes and be ready to raise.
 - The corner is the next problem regardless. A weave-free car will finally expose
-  the cornering / entry-speed issue (the flips at corner distance), which is the
-  run10+ racing-line work.
+  the cornering/entry-speed issue (the flips at corner distance) -> run10 racing line.
 
-## 8. Fresh vs keep-running (Mike's call at launch)
+## 8. Fresh vs keep, and why the racing line is run10 not run9
 
-Recommendation: FRESH. The weave is the entrenched main strategy at 245k training
-age, and a penalty that finally bites it will be fighting that entrenched policy.
-The run4 lesson is explicit: warm-starting a policy whose dominant behavior you then
-penalize ENTRENCHES it. run8_resume's 484m corner progress is real but it belongs to
-a weaving policy we do not want to carry forward. Going fresh costs compute, not a
-banked peak (EvalCallback saves best_model). Keep run8_resume training until the
-moment we launch run9 so we lose nothing if Mike wants to ride it longer first.
+Fresh: confirmed by chat and CC. The weave is the entrenched main strategy at ~245k
+training age; a penalty that finally bites it would fight that policy, the run4
+entrenchment mistake a third time. run8_resume's 484m corner progress belongs to a
+weaving policy we do not want to carry. Cost is compute, not a banked peak. Keep
+run8_resume training until the moment we launch run9 so nothing is lost.
+
+Racing line deferred to run10 (Mike's design point): the right way to make a good
+corner line "more valuable than the oscillation cost" is to make the reference path
+the racing line itself, so progress rewards following the good line and oscillation
+is penalized around it everywhere, with no corner gate. That is the root fix for
+corner shaping, but it needs track-edge extraction + an offline minimum-curvature
+optimizer, and the car cannot yet reliably reach corners. So fix the observed straight
+weave first (run9), then let the racing line shape corners and subsume the geometry
+gate (run10).
 
 ## 9. Constraints reminder for CC
 
 - One change at a time, measure don't assume, smoke before any full run.
 - Pose-independent gating only: centerline geometry + center_off, never observation
-  bearings (the earlier trap).
+  bearings.
 - The weave penalty is pure reward arithmetic, zero sim load. The sim freeze at
   ~67.8k is a separate mechanical issue (corner-rollover hypothesis); keep the
   freeze-detector armed on whatever is training.
-- Pattern: CC pokes holes / refines this against the real env code and the trace,
-  proposes the final form, Mike approves, CC smokes, Mike approves the full run.
+- Pattern: CC locks N + the trigger and builds, Mike approves, CC smokes, Mike
+  approves the full run.
