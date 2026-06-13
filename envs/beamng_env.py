@@ -98,6 +98,27 @@ SMOOTH_WEIGHT = 0.2
 # axis is the most direct route to timidity. Raise toward 0.08-0.1 only if
 # chatter persists.
 THROTTLE_SMOOTH_WEIGHT = 0.05
+# Anti-weave penalty (run8, spatial-smoothness PROXY). run7 drove forward but
+# WEAVED -- ~0.75 Hz steering oscillation on the straight, spinning out when it
+# threw throttle at a swing extreme. The total-variation steering penalty is
+# frequency-blind (a slow weave accrues ~13x less/sec than the fast chatter it
+# was tuned against), and raising its weight can't fix it without crushing real
+# cornering. Fix: penalize steering EFFORT where neither the track nor the line
+# calls for it. Gates are POSE-INDEPENDENT (centerline tangent + center_off),
+# NOT the nose-contaminated obs bearings (which swing with the weave and would
+# make the gate circular). penalty = -WEAVE_WEIGHT * max(0,|steer|-STEER_DEAD)
+# * straightness * on_line, where straightness keys off the centerline bend over
+# the next WEAVE_LOOK_M (releases before turn-in) and on_line off center_off
+# (releases for drift-back correction). Frequency-independent (charges |steer|
+# held, not its change) and zero whenever steering is actually warranted, so it
+# cannot induce timidity. Full CAPS spatial smoothness is the run9 fallback.
+WEAVE_WEIGHT = 0.6
+WEAVE_LOOK_M = 80.0          # straightness horizon; > turn-in distance for all corners
+WEAVE_BEND_DEAD = math.radians(3.0)   # bend below this = fully straight
+WEAVE_BEND_FULL = math.radians(15.0)  # bend above this = corner, gate fully released
+WEAVE_OFF_DEAD = 1.0         # |center_off| below this = on-line (gate active)
+WEAVE_OFF_FULL = 2.5         # above this = off-line drift-back, gate released
+WEAVE_STEER_DEAD = 0.1       # small steering on a straight is free
 # Anti-wheelspin penalty (run4): punish burning the rear tyres off the line, the
 # traction root-cause under run3's spin-out variance. slip = wheelspeed (wheel-
 # rotation speed from Electrics) minus speed_horizontal (true ground speed); a
@@ -299,6 +320,8 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._last_heading_align = 1.0   # nose vs tangent (run5 heading gate)
         self._backward_steps = 0         # consecutive backward-facing steps
         self._last_throttle_smooth_penalty = 0.0
+        self._last_weave_penalty = 0.0   # run8 anti-weave penalty
+        self._center_off = 0.0           # set by _get_observation, read by the gate
         # run7 instrumentation (pure logging, no reward-path effect): why the
         # episode ended, plus per-episode aggregates for diagnosing timidity
         # (mean speed), near-spins that were caught (recovered_count, min
@@ -441,6 +464,8 @@ class BeamNGRaceEnv(gymnasium.Env):
         # run5 heading gate: spawn faces down-track, no backward streak yet.
         self._last_heading_align = 1.0
         self._backward_steps = 0
+        # run8 anti-weave penalty diagnostic.
+        self._last_weave_penalty = 0.0
         # run7 instrumentation: fresh episode aggregates.
         self._last_term_reason = "run"
         self._recovered_count = 0
@@ -492,6 +517,7 @@ class BeamNGRaceEnv(gymnasium.Env):
             "speed_reward": float(self._last_speed_reward),
             "smoothness_penalty": float(self._last_smoothness_penalty),
             "throttle_smooth_penalty": float(self._last_throttle_smooth_penalty),
+            "weave_penalty": float(self._last_weave_penalty),
             "slip": float(self._last_slip),
             "spin_penalty": float(self._last_spin_penalty),
             "heading_align": float(self._last_heading_align),
@@ -602,6 +628,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         c_next = CENTERLINE[(idx + 1) % len(CENTERLINE)]
         heading_err = _bearing_to(forward, pos, look_pts[0])
         center_off = _perp_distance(pos, c_curr, c_next)
+        self._center_off = center_off   # read by the run8 weave gate (on_line)
 
         vals = [
             speed / MAX_SPEED_M_S,
@@ -700,6 +727,7 @@ class BeamNGRaceEnv(gymnasium.Env):
             self._last_speed_reward = 0.0
             self._last_smoothness_penalty = 0.0
             self._last_throttle_smooth_penalty = 0.0
+            self._last_weave_penalty = 0.0
             self._last_slip = wheelspeed - speed_horizontal
             self._max_slip = max(self._max_slip, self._last_slip)
             self._last_spin_penalty = 0.0
@@ -739,12 +767,32 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._max_slip = max(self._max_slip, slip)
         spin_penalty = -SPIN_WEIGHT * max(0.0, slip - SLIP_DEADZONE)
 
+        # Anti-weave penalty (run8): penalize steering effort only where neither
+        # the track nor the line calls for it. straightness from the centerline
+        # bend over the next WEAVE_LOOK_M (pose-independent; releases before
+        # turn-in); on_line from center_off (pose-independent; releases for
+        # drift-back). forward_yaw is the centerline tangent at the car (above).
+        anchor = self._cur_centerline_dist % self._track_length
+        far_idx = bisect.bisect_right(
+            self._cum_arc, (anchor + WEAVE_LOOK_M) % self._track_length) - 1
+        far_idx = min(max(far_idx, 0), len(CENTERLINE) - 1)
+        bend = abs((self._smoothed_forward_yaw(far_idx) - forward_yaw + math.pi)
+                   % (2 * math.pi) - math.pi)
+        straightness = max(0.0, min(1.0, (WEAVE_BEND_FULL - bend)
+                                    / (WEAVE_BEND_FULL - WEAVE_BEND_DEAD)))
+        on_line = max(0.0, min(1.0, (WEAVE_OFF_FULL - abs(self._center_off))
+                               / (WEAVE_OFF_FULL - WEAVE_OFF_DEAD)))
+        weave_penalty = (-WEAVE_WEIGHT
+                         * max(0.0, abs(self._cur_steer) - WEAVE_STEER_DEAD)
+                         * straightness * on_line)
+
         self._last_raw_progress = raw_progress
         self._last_raw_alignment = raw_alignment
         self._last_final_reward = final_reward
         self._last_speed_reward = speed_reward
         self._last_smoothness_penalty = smoothness_penalty
         self._last_throttle_smooth_penalty = throttle_smooth_penalty
+        self._last_weave_penalty = weave_penalty
         self._last_slip = slip
         self._last_spin_penalty = spin_penalty
 
@@ -765,10 +813,11 @@ class BeamNGRaceEnv(gymnasium.Env):
                 self._checkpoints_reached += 1
                 checkpoint_bonus += CHECKPOINT_BONUS
         # Existing progress/checkpoint terms stay dominant; the speed/smoothness
-        # nudges, wheelspin penalty, and run6 throttle-smoothness layer on top.
+        # nudges, wheelspin penalty, throttle-smoothness, and run8 weave penalty
+        # layer on top.
         return float(final_reward + checkpoint_bonus + speed_reward
                      + smoothness_penalty + throttle_smooth_penalty
-                     + spin_penalty)
+                     + spin_penalty + weave_penalty)
 
     def _check_done(self) -> Tuple[bool, float]:
         """Did the episode end? If so, what bonus or penalty applies?
