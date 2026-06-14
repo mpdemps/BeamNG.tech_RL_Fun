@@ -1,0 +1,12 @@
+# Normalize line endings: store text as LF in the repo, check out native.
+# Stops CRLF/LF phantom whole-file diffs between the Linux mini and Windows G14.
+* text=auto eol=lf
+
+# Be explicit about common binaries so renormalize never touches them.
+*.zip binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pt binary
+*.npy binary
+*.npz binary
