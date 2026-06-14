@@ -123,12 +123,28 @@ PREVIEW_L_MAX = 120.0        # m; cap (~1.5s preview to top speed; only binds on
 # traction root-cause under run3's spin-out variance. slip = wheelspeed (wheel-
 # rotation speed from Electrics) minus speed_horizontal (true ground speed); a
 # spinning wheel reads far faster than the car moves. Penalize only slip beyond a
-# deadzone so normal grip-slip and cornering are free and only genuine wheelspin
-# costs. Sensor-validated (scripts/wheelspin_probe*.py): clean cruise slip is
-# < 0.3 m/s, launch wheelspin is +5 to +14 m/s, so a 2.0 m/s deadzone cleanly
-# separates them. spin_penalty = -SPIN_WEIGHT * max(0, slip - SLIP_DEADZONE).
-SLIP_DEADZONE = 2.0
+# deadzone. run11 raises SLIP_DEADZONE 2.0 -> 4.0 to match TC_SLIP_DEAD: CC's launch
+# sweep showed optimal acceleration at slip ~3 (throttle 0.3 -> 21 m/s) and runaway
+# at slip >=7.5 (accel collapses), so 2-4 is the PRODUCTIVE slip band the TC cap
+# deliberately permits. With the deadzone at 4.0 the penalty no longer charges on
+# that productive band (it would fight the cap) -- it only fires where TC is already
+# cutting. spin_penalty = -SPIN_WEIGHT * max(0, slip - SLIP_DEADZONE).
+SLIP_DEADZONE = 4.0
 SPIN_WEIGHT = 0.05
+# Traction control (run11, STRUCTURAL throttle-axis fix). Locked diagnosis (CC's spin
+# probes): rear slip from a pinned/pulsing-high throttle LEADS the steering sign-flip
+# 3-6 steps at both peak and maturity -> throttle-induced oversteer, the steering
+# weave is reactive counter-steer (five steering-axis runs 6-10 never touched it). A
+# reward penalty gets outvoted (run4 wheelspin penalty charged but the policy floored
+# anyway), so the fix is structural: cap applied throttle on measured rear slip, like
+# real TC. Below TC_SLIP_DEAD full power; DEAD..FULL scales down; >=FULL cut to
+# TC_MIN_THR. Constants from the launch sweep (optimum slip ~3, runaway ~7.5): DEAD
+# above the productive band, FULL at runaway onset, MIN a small anti-bog floor so the
+# standing-start transient can't stall the launch. Gated on last-step slip (one 50ms
+# step, real-TC sensor lag). Brake path untouched. See scripts/run11_traction_sweep.py.
+TC_SLIP_DEAD = 4.0
+TC_SLIP_FULL = 7.0
+TC_MIN_THR = 0.1
 # Heading kill-switch (run5): the reward was heading-BLIND -- it gated on
 # velocity-vs-tangent but never on which way the nose points, so a spun-out car
 # sliding/coasting down-track earned full progress + speed + checkpoint reward
@@ -334,6 +350,8 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._max_arc = 0.0
         self._min_heading_align = 1.0
         self._max_slip = 0.0
+        self._tc_cut_sum = 0.0       # run11 TC: episode sum of (requested-applied) throttle
+        self._tc_cut_steps = 0       # run11 TC: episode count of steps TC cut throttle
         # Steering smoothness tracker (run2): _cur_steer is this tick's steer,
         # _prev_steer last tick's; their difference drives smoothness_penalty.
         # run6 adds the same for throttle/brake (action[1]).
@@ -472,6 +490,8 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._max_arc = 0.0
         self._min_heading_align = 1.0
         self._max_slip = 0.0
+        self._tc_cut_sum = 0.0       # run11 TC: episode sum of (requested-applied) throttle
+        self._tc_cut_steps = 0       # run11 TC: episode count of steps TC cut throttle
         return self._get_observation(), {}
 
     def step(self, action):
@@ -484,7 +504,18 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._cur_throttle = thr  # read by _compute_reward's throttle-smoothness
         throttle = max(0.0, thr)
         brake = max(0.0, -thr)
-        _shared["vehicle"].control(steering=steer, throttle=throttle,
+        # run11 traction control: cap applied throttle on last-step rear slip (one
+        # 50ms-step sensor lag, like real TC). Below DEAD full power; DEAD..FULL
+        # scales down; >=FULL cut to TC_MIN_THR. Brake path untouched. The policy may
+        # keep flooring; the car physically cannot dump spin-inducing power.
+        tc_factor = max(TC_MIN_THR, min(1.0, 1.0 - (self._last_slip - TC_SLIP_DEAD)
+                                        / (TC_SLIP_FULL - TC_SLIP_DEAD)))
+        applied_throttle = throttle * tc_factor
+        # TC-cut telemetry (logged as episode aggregates): how much / how often.
+        self._tc_cut_sum += (throttle - applied_throttle)
+        if throttle > 0.01 and tc_factor < 0.999:
+            self._tc_cut_steps += 1
+        _shared["vehicle"].control(steering=steer, throttle=applied_throttle,
                                    brake=brake)
 
         # Advance 3 physics steps (~50 ms at 60 Hz).
@@ -527,6 +558,10 @@ class BeamNGRaceEnv(gymnasium.Env):
             "max_arc": float(self._max_arc),
             "min_heading_align": float(self._min_heading_align),
             "max_slip": float(self._max_slip),
+            # run11 traction-control telemetry: how OFTEN TC cut (fraction of steps)
+            # and how MUCH on average (mean throttle reduction per step).
+            "tc_cut_frac": float(self._tc_cut_steps / max(self._ep_steps, 1)),
+            "tc_cut_mean": float(self._tc_cut_sum / max(self._ep_steps, 1)),
         }
         return obs, reward + term_bonus, terminated, truncated, info
 

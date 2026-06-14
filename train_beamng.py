@@ -173,7 +173,7 @@ def main():
                          "checkpoints_reached",
                          "termination_reason", "recovered_count",
                          "mean_speed", "max_arc", "min_heading_align",
-                         "max_slip")
+                         "max_slip", "tc_cut_frac", "tc_cut_mean")
     train_env = Monitor(
         make_beamng_env(
             # Curriculum: fixed start at the start/finish line (idx=0) every
