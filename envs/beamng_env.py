@@ -98,36 +98,27 @@ SMOOTH_WEIGHT = 0.2
 # axis is the most direct route to timidity. Raise toward 0.08-0.1 only if
 # chatter persists.
 THROTTLE_SMOOTH_WEIGHT = 0.05
-# Anti-weave penalty (run8, spatial-smoothness PROXY). run7 drove forward but
-# WEAVED -- ~0.75 Hz steering oscillation on the straight, spinning out when it
-# threw throttle at a swing extreme. run8's position-gated form FAILED (CC's
-# trace logs/run8_weave_trace.csv): the weave swings center_off to 2-3.4m, so the
-# on_line gate (keyed on |center_off|) released exactly when the weave got
-# dangerous, and the penalty read ~0 (mean -0.003) across the whole 80->115 kph
-# weave-into-spin. Position-gating a |steer| penalty cannot catch an oscillation,
-# because the oscillation lives in the positions that disable the gate.
-#
-# run9 form: penalize the OSCILLATION ITSELF, by its lateral-velocity signature,
-# gated by straightness only (NO position gate). A weave is repeated reversals of
-# lateral motion; a recovery/drift-back is monotonic (zero reversals); a corner is
-# monotonic + handled by straightness. So: detect zigzag reversals of center_off
-# (a reversal counts only when it retraces > WEAVE_REV_AMP_DEAD from the swing
-# extreme -- jitter-immune, so a single correction, even noisy, is exactly ONE
-# reversal and can never trigger); when >=2 reversals fall within the last
-# WEAVE_OSC_WINDOW steps (one measured weave cycle), charge the lateral velocity:
-#   weave_penalty = -WEAVE_WEIGHT * max(0,|lat_vel|-WEAVE_LAT_DEAD) * straightness
-# Pose-independent (center_off is centerline geometry, not nose bearings),
-# outcome-based (penalizes the snaking PATH, not a steerable input), frequency-
-# robust (each reversal charged by amplitude), and timidity-proof BY CONSTRUCTION:
-# a lone legitimate correction has one reversal, so it is never penalized. N=12
-# and the deadbands are measured from the trace (scripts/run9_lock_oscwindow.py).
-WEAVE_WEIGHT = 3.0
-WEAVE_LOOK_M = 40.0          # straightness horizon; live thru the back straight, releases ~24m before R40 turn-in
-WEAVE_BEND_DEAD = math.radians(3.0)   # bend below this = fully straight
-WEAVE_BEND_FULL = math.radians(15.0)  # bend above this = corner, gate fully released
-WEAVE_LAT_DEAD = 0.05        # |center_off change|/step below this is free (1.0 m/s lateral: noise/micro)
-WEAVE_OSC_WINDOW = 12        # steps (~one measured weave cycle); >=2 reversals inside => oscillating
-WEAVE_REV_AMP_DEAD = 0.10    # a reversal must retrace >10cm from the swing extreme to count (jitter debounce)
+# Weave fix (run10, STRUCTURAL -- ends the reward-penalty era). Runs 6-9 tried four
+# reward penalties; all failed. CC's traces proved the weave is a CONTROL
+# INSTABILITY, not a rewarded proxy: heading_err aimed at a FIXED 10m point, so the
+# preview time (10m/speed) collapsed from ~1.5s at low speed to ~0.32s at 115 kph
+# -- the classic pure-pursuit hunting setup. Measured signature (run8 trace): the
+# weave's half-period shrank 1.09s->0.28s (frequency ~4x) and amplitude grew as
+# speed rose 58->109 kph. You cannot penalize away a control instability; fix the
+# reference. run10 scales the steering-reference lookahead with speed so the preview
+# time stays ~constant (PREVIEW_TIME) instead of collapsing:
+#   L_d = clip(PREVIEW_TIME * speed_horizontal, L_MIN, L_MAX)
+#   heading_err = bearing(car -> centerline point L_d ahead)  [interpolated on _cum_arc]
+# L_MIN=10 == the old fixed point, so launch is unchanged; L_MAX=120 keeps ~1.5s
+# preview to the car's ~77 m/s top speed on the 694m straight (a 50m cap would drop
+# it to ~0.65s there and the weave could re-emerge). Geometry check: 120m only binds
+# at high speed, which occurs on the long straights; corner-cutting at the long-
+# straight ENDS is a known G14 watch-item (lower PREVIEW_TIME/L_MAX if it understeers).
+# The run9 oscillation reward-penalty is DROPPED (the reference fix is the sole weave
+# mechanism, for clean attribution). Pose-independent (centerline arc geometry).
+PREVIEW_TIME = 1.5           # s; target preview time the speed-scaled lookahead holds
+PREVIEW_L_MIN = 10.0         # m; floor (== old fixed point, keeps launch working)
+PREVIEW_L_MAX = 120.0        # m; cap (~1.5s preview to top speed; only binds on long straights)
 # Anti-wheelspin penalty (run4): punish burning the rear tyres off the line, the
 # traction root-cause under run3's spin-out variance. slip = wheelspeed (wheel-
 # rotation speed from Electrics) minus speed_horizontal (true ground speed); a
@@ -329,17 +320,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._last_heading_align = 1.0   # nose vs tangent (run5 heading gate)
         self._backward_steps = 0         # consecutive backward-facing steps
         self._last_throttle_smooth_penalty = 0.0
-        self._last_weave_penalty = 0.0   # run9 anti-weave penalty (per-step)
-        self._weave_sum = 0.0            # episode sum of weave_penalty (for the logged mean)
-        self._center_off = 0.0           # set by _get_observation, read by the gate
-        # run9 oscillation tracker: zigzag-debounced lateral reversals of
-        # center_off. _swing_dir is the current lateral direction (+1/-1/0),
-        # _swing_extreme the running extreme since the last reversal, _rev_steps
-        # the step-indices of recent reversals (pruned to WEAVE_OSC_WINDOW).
-        self._prev_center_off = 0.0
-        self._swing_dir = 0
-        self._swing_extreme = 0.0
-        self._rev_steps: list = []
+        self._center_off = 0.0           # set by _get_observation -> obs[2]
         # run7 instrumentation (pure logging, no reward-path effect): why the
         # episode ended, plus per-episode aggregates for diagnosing timidity
         # (mean speed), near-spins that were caught (recovered_count, min
@@ -482,8 +463,6 @@ class BeamNGRaceEnv(gymnasium.Env):
         # run5 heading gate: spawn faces down-track, no backward streak yet.
         self._last_heading_align = 1.0
         self._backward_steps = 0
-        # run8 anti-weave penalty diagnostic.
-        self._last_weave_penalty = 0.0
         # run7 instrumentation: fresh episode aggregates.
         self._last_term_reason = "run"
         self._recovered_count = 0
@@ -535,10 +514,6 @@ class BeamNGRaceEnv(gymnasium.Env):
             "speed_reward": float(self._last_speed_reward),
             "smoothness_penalty": float(self._last_smoothness_penalty),
             "throttle_smooth_penalty": float(self._last_throttle_smooth_penalty),
-            # run9 H3 fix: log the episode MEAN weave penalty (sum over steps /
-            # steps), captured before the kill-switch zeroing, so the CSV reports
-            # whether the term bites instead of the kill-switched terminal value.
-            "weave_penalty": float(self._weave_sum / max(self._ep_steps, 1)),
             "slip": float(self._last_slip),
             "spin_penalty": float(self._last_spin_penalty),
             "heading_align": float(self._last_heading_align),
@@ -647,9 +622,17 @@ class BeamNGRaceEnv(gymnasium.Env):
         idx = self._progress_idx
         c_curr = CENTERLINE[idx]
         c_next = CENTERLINE[(idx + 1) % len(CENTERLINE)]
-        heading_err = _bearing_to(forward, pos, look_pts[0])
+        # run10 speed-scaled steering reference: aim L_d ahead, L_d growing with
+        # speed so the preview time stays ~PREVIEW_TIME instead of collapsing at
+        # speed (the fixed-10m point was the pure-pursuit hunting setup). Floors at
+        # PREVIEW_L_MIN (== old 10m point, so launch is unchanged), caps at
+        # PREVIEW_L_MAX. Interpolated on _cum_arc (pose-independent geometry).
+        speed_h = math.sqrt(vel[0] ** 2 + vel[1] ** 2)
+        l_d = min(PREVIEW_L_MAX, max(PREVIEW_L_MIN, PREVIEW_TIME * speed_h))
+        ref_point = self._point_at_arc(anchor + l_d)
+        heading_err = _bearing_to(forward, pos, ref_point)
         center_off = _perp_distance(pos, c_curr, c_next)
-        self._center_off = center_off   # read by the run9 weave oscillation tracker
+        self._center_off = center_off   # lateral placement signal -> obs[2]
 
         vals = [
             speed / MAX_SPEED_M_S,
@@ -748,7 +731,6 @@ class BeamNGRaceEnv(gymnasium.Env):
             self._last_speed_reward = 0.0
             self._last_smoothness_penalty = 0.0
             self._last_throttle_smooth_penalty = 0.0
-            self._last_weave_penalty = 0.0
             self._last_slip = wheelspeed - speed_horizontal
             self._max_slip = max(self._max_slip, self._last_slip)
             self._last_spin_penalty = 0.0
@@ -788,49 +770,9 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._max_slip = max(self._max_slip, slip)
         spin_penalty = -SPIN_WEIGHT * max(0.0, slip - SLIP_DEADZONE)
 
-        # Anti-weave penalty (run9): penalize the lateral OSCILLATION itself,
-        # gated by straightness only (no position gate; see the constants note).
-        # straightness from the centerline bend over the next WEAVE_LOOK_M
-        # (pose-independent; releases before turn-in). forward_yaw is the
-        # centerline tangent at the car (above).
-        anchor = self._cur_centerline_dist % self._track_length
-        far_idx = bisect.bisect_right(
-            self._cum_arc, (anchor + WEAVE_LOOK_M) % self._track_length) - 1
-        far_idx = min(max(far_idx, 0), len(CENTERLINE) - 1)
-        bend = abs((self._smoothed_forward_yaw(far_idx) - forward_yaw + math.pi)
-                   % (2 * math.pi) - math.pi)
-        straightness = max(0.0, min(1.0, (WEAVE_BEND_FULL - bend)
-                                    / (WEAVE_BEND_FULL - WEAVE_BEND_DEAD)))
-        # Zigzag-debounced lateral reversal detection on center_off: a reversal
-        # counts only when the line retraces > WEAVE_REV_AMP_DEAD from the swing
-        # extreme, so sensor jitter never manufactures one and a lone correction
-        # is exactly one reversal. >=2 reversals within WEAVE_OSC_WINDOW steps
-        # (one weave cycle) => oscillating; then charge the lateral velocity.
-        co = self._center_off
-        if self._swing_dir >= 0 and co > self._swing_extreme:
-            self._swing_extreme = co
-        elif self._swing_dir <= 0 and co < self._swing_extreme:
-            self._swing_extreme = co
-        if self._swing_dir >= 0 and self._swing_extreme - co > WEAVE_REV_AMP_DEAD:
-            if self._swing_dir == 1:
-                self._rev_steps.append(self._ep_steps)
-            self._swing_dir = -1
-            self._swing_extreme = co
-        elif self._swing_dir <= 0 and co - self._swing_extreme > WEAVE_REV_AMP_DEAD:
-            if self._swing_dir == -1:
-                self._rev_steps.append(self._ep_steps)
-            self._swing_dir = 1
-            self._swing_extreme = co
-        elif self._swing_dir == 0:
-            self._swing_dir = 1 if co >= self._swing_extreme else -1
-        self._rev_steps = [s for s in self._rev_steps
-                           if s > self._ep_steps - WEAVE_OSC_WINDOW]
-        oscillating = 1.0 if len(self._rev_steps) >= 2 else 0.0
-        lateral_vel = co - self._prev_center_off
-        self._prev_center_off = co
-        weave_penalty = (-WEAVE_WEIGHT
-                         * max(0.0, abs(lateral_vel) - WEAVE_LAT_DEAD)
-                         * oscillating * straightness)
+        # (run10) The weave is fixed structurally via the speed-scaled steering
+        # reference in _get_observation, not by a reward penalty -- runs 6-9 proved
+        # reward shaping cannot remove a control instability. No weave term here.
 
         self._last_raw_progress = raw_progress
         self._last_raw_alignment = raw_alignment
@@ -838,8 +780,6 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._last_speed_reward = speed_reward
         self._last_smoothness_penalty = smoothness_penalty
         self._last_throttle_smooth_penalty = throttle_smooth_penalty
-        self._last_weave_penalty = weave_penalty
-        self._weave_sum += weave_penalty   # episode sum -> logged as a mean (H3 fix)
         self._last_slip = slip
         self._last_spin_penalty = spin_penalty
 
@@ -864,7 +804,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         # layer on top.
         return float(final_reward + checkpoint_bonus + speed_reward
                      + smoothness_penalty + throttle_smooth_penalty
-                     + spin_penalty + weave_penalty)
+                     + spin_penalty)
 
     def _check_done(self) -> Tuple[bool, float]:
         """Did the episode end? If so, what bonus or penalty applies?
