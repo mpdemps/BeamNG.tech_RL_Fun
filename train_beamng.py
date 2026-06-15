@@ -29,6 +29,7 @@ import os
 from pathlib import Path
 
 from stable_baselines3 import SAC
+from gradcaps_sac import GradCapsSAC  # run12: SAC + Grad-CAPS actor-loss smoothness
 from stable_baselines3.common.callbacks import (
     BaseCallback, CheckpointCallback, EvalCallback)
 from stable_baselines3.common.monitor import Monitor
@@ -127,6 +128,9 @@ def parse_args():
                    help="Random-action steps before learning. Set 0 for "
                         "warm-start so the LOADED policy drives from step 0 "
                         "(SAC takes random actions during these steps).")
+    p.add_argument("--lambda-t", type=float, default=1.0,
+                   help="run12 Grad-CAPS temporal action-smoothness weight in the "
+                        "actor loss. 0 disables (plain SAC).")
     return p.parse_args()
 
 
@@ -173,7 +177,8 @@ def main():
                          "checkpoints_reached",
                          "termination_reason", "recovered_count",
                          "mean_speed", "max_arc", "min_heading_align",
-                         "max_slip", "tc_cut_frac", "tc_cut_mean")
+                         "max_slip", "tc_cut_frac", "tc_cut_mean",
+                         "steer_fluct", "throttle_fluct", "steer_hf", "throttle_hf")
     train_env = Monitor(
         make_beamng_env(
             # Curriculum: fixed start at the start/finish line (idx=0) every
@@ -219,10 +224,10 @@ def main():
         # usual random-action warmup -- the proof the warm-start took.
         if not os.path.isfile(args.warm_start):
             raise SystemExit(f"--warm-start file not found: {args.warm_start}")
-        print(f"WARM-START: SAC.load({args.warm_start})  "
-              f"lr={args.learning_rate}  learning_starts={args.learning_starts}",
-              flush=True)
-        model = SAC.load(
+        print(f"WARM-START: GradCapsSAC.load({args.warm_start})  "
+              f"lr={args.learning_rate}  learning_starts={args.learning_starts}  "
+              f"lambda_t={args.lambda_t}", flush=True)
+        model = GradCapsSAC.load(
             args.warm_start,
             env=train_env,
             device="cpu",
@@ -233,13 +238,18 @@ def main():
             learning_starts=args.learning_starts,
             tensorboard_log=str(log_dir),
         )
+        # load() doesn't pass our custom __init__ args through; set them explicitly.
+        model.lambda_t = args.lambda_t
+        model.gradcaps_batch = 256
     else:
-        model = SAC(
+        model = GradCapsSAC(
             "MlpPolicy",
             train_env,
             verbose=1,
             tensorboard_log=str(log_dir),
             device="cpu",
+            lambda_t=args.lambda_t,
+            gradcaps_batch=256,
             **hyperparams,
         )
 

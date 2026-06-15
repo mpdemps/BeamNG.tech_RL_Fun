@@ -108,11 +108,12 @@ def crashed(run):
         return False
 
 
-def launch(run, timesteps, lr, warm):
+def launch(run, timesteps, lr, warm, lambda_t):
     """Launch a training segment as a child process, tee to console log."""
     os.makedirs("logs", exist_ok=True)
     cmd = [sys.executable, "train_beamng.py", "--run-name", run,
-           "--timesteps", str(timesteps), "--nogpu", "--learning-rate", str(lr)]
+           "--timesteps", str(timesteps), "--nogpu", "--learning-rate", str(lr),
+           "--lambda-t", str(lambda_t)]
     if warm:
         cmd += ["--warm-start", warm, "--learning-starts", "0"]
     log = open(console_log(run), "w")
@@ -134,6 +135,7 @@ def main():
     ap.add_argument("--total", type=int, required=True)
     ap.add_argument("--lr", default="1e-4")
     ap.add_argument("--warm", default=None)
+    ap.add_argument("--lambda-t", type=float, default=1.0)
     args = ap.parse_args()
 
     done = 0
@@ -144,7 +146,7 @@ def main():
         remaining = args.total - done
         print(f"[supervisor] segment {seg}: run={run} remaining={remaining} "
               f"warm={warm or 'FRESH'}", flush=True)
-        p, log = launch(run, remaining, args.lr, warm)
+        p, log = launch(run, remaining, args.lr, warm, args.lambda_t)
 
         outcome = None
         while True:

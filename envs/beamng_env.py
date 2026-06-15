@@ -242,6 +242,22 @@ from data.centerline_racetrack_builtin import CENTERLINE
 _shared: dict = {"bng": None, "vehicle": None, "initialized": False}
 
 
+def _hf_energy_frac(stream) -> float:
+    """run12 logging only: fraction of an action stream's spectral energy in the upper
+    half of the frequency band (a high-frequency / chatter proxy). Trends DOWN as the
+    Grad-CAPS regularizer removes zigzag; complements mean |Δaction|."""
+    if len(stream) < 8:
+        return 0.0
+    x = np.asarray(stream, dtype=np.float64)
+    x = x - x.mean()
+    mag = np.abs(np.fft.rfft(x)) ** 2
+    total = mag.sum()
+    if total <= 0.0:
+        return 0.0
+    half = len(mag) // 2
+    return float(mag[half:].sum() / total)
+
+
 def _connect(home: Optional[str], host: str, port: int, launch: bool,
              headless: bool, nogpu: bool) -> None:
     """Open BeamNG, load our scenario, and put it in deterministic mode.
@@ -352,6 +368,8 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._max_slip = 0.0
         self._tc_cut_sum = 0.0       # run11 TC: episode sum of (requested-applied) throttle
         self._tc_cut_steps = 0       # run11 TC: episode count of steps TC cut throttle
+        self._steer_stream = []      # run12 logging: per-episode commanded steer/throttle
+        self._thr_stream = []
         # Steering smoothness tracker (run2): _cur_steer is this tick's steer,
         # _prev_steer last tick's; their difference drives smoothness_penalty.
         # run6 adds the same for throttle/brake (action[1]).
@@ -492,6 +510,8 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._max_slip = 0.0
         self._tc_cut_sum = 0.0       # run11 TC: episode sum of (requested-applied) throttle
         self._tc_cut_steps = 0       # run11 TC: episode count of steps TC cut throttle
+        self._steer_stream = []      # run12 logging: per-episode commanded steer/throttle
+        self._thr_stream = []
         return self._get_observation(), {}
 
     def step(self, action):
@@ -502,6 +522,8 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._cur_steer = steer   # read by _compute_reward's smoothness penalty
         thr = float(np.clip(action[1], -1.0, 1.0))
         self._cur_throttle = thr  # read by _compute_reward's throttle-smoothness
+        self._steer_stream.append(steer)   # run12 action-fluctuation logging (commanded)
+        self._thr_stream.append(thr)
         throttle = max(0.0, thr)
         brake = max(0.0, -thr)
         # run11 traction control: cap applied throttle on last-step rear slip (one
@@ -562,6 +584,12 @@ class BeamNGRaceEnv(gymnasium.Env):
             # and how MUCH on average (mean throttle reduction per step).
             "tc_cut_frac": float(self._tc_cut_steps / max(self._ep_steps, 1)),
             "tc_cut_mean": float(self._tc_cut_sum / max(self._ep_steps, 1)),
+            # run12 action-smoothness logging (Monitor logs the terminal step's value =
+            # the whole-episode figure): mean |Δaction| per axis + high-freq energy.
+            "steer_fluct": float(np.abs(np.diff(self._steer_stream)).mean()) if len(self._steer_stream) > 1 else 0.0,
+            "throttle_fluct": float(np.abs(np.diff(self._thr_stream)).mean()) if len(self._thr_stream) > 1 else 0.0,
+            "steer_hf": _hf_energy_frac(self._steer_stream),
+            "throttle_hf": _hf_energy_frac(self._thr_stream),
         }
         return obs, reward + term_bonus, terminated, truncated, info
 
