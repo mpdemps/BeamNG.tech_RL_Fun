@@ -318,7 +318,7 @@ class BeamNGRaceEnv(gymnasium.Env):
     def __init__(self, random_spawn: bool, home: Optional[str] = None,
                  host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                  launch: bool = False, headless: bool = False,
-                 nogpu: bool = False):
+                 nogpu: bool = False, steer_rate: float = 0.0):
         super().__init__()
         # Connection params are stored here; we actually open BeamNG lazily
         # in reset(), so constructing the env never fails on its own.
@@ -329,6 +329,11 @@ class BeamNGRaceEnv(gymnasium.Env):
         self.launch = launch
         self.headless = headless
         self.nogpu = nogpu
+        # run13 steering slew-rate limit: symmetric cap on |Δsteer|/step (action[0]).
+        # 0.0 = OFF (default), so the shared env file does not change behavior for any
+        # run that does not explicitly enable it (protects the concurrently-running
+        # run12 if it self-heals and re-imports this module). run13 sets 0.5.
+        self.steer_rate = steer_rate
 
         # 15 = speed + heading_err + center_off + 6 lookahead points x (dist,
         # bearing). NOTE: this shape change makes pre-run6 models unloadable
@@ -368,8 +373,10 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._max_slip = 0.0
         self._tc_cut_sum = 0.0       # run11 TC: episode sum of (requested-applied) throttle
         self._tc_cut_steps = 0       # run11 TC: episode count of steps TC cut throttle
-        self._steer_stream = []      # run12 logging: per-episode commanded steer/throttle
+        self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
         self._thr_stream = []
+        self._rl_prev_steer = 0.0    # run13: last APPLIED steer (rate-limit ramps from here)
+        self._steer_clip_steps = 0   # run13: episode count of steps the steer-rate clipped
         # Steering smoothness tracker (run2): _cur_steer is this tick's steer,
         # _prev_steer last tick's; their difference drives smoothness_penalty.
         # run6 adds the same for throttle/brake (action[1]).
@@ -510,19 +517,34 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._max_slip = 0.0
         self._tc_cut_sum = 0.0       # run11 TC: episode sum of (requested-applied) throttle
         self._tc_cut_steps = 0       # run11 TC: episode count of steps TC cut throttle
-        self._steer_stream = []      # run12 logging: per-episode commanded steer/throttle
+        self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
         self._thr_stream = []
+        self._rl_prev_steer = 0.0    # run13: last APPLIED steer (rate-limit ramps from here)
+        self._steer_clip_steps = 0   # run13: episode count of steps the steer-rate clipped
         return self._get_observation(), {}
 
     def step(self, action):
         """Push the AI's buttons, advance 50 ms of car-time, then look around."""
         # action[0] -> steering in [-1, 1]
         # action[1] -> throttle (>0) or brake (<0)
-        steer = float(np.clip(action[0], -1.0, 1.0))
-        self._cur_steer = steer   # read by _compute_reward's smoothness penalty
+        requested_steer = float(np.clip(action[0], -1.0, 1.0))
+        # run13 steering slew-rate limit (gated; steer_rate=0 -> OFF, no change):
+        # cap |Δsteer|/step symmetrically so a full-lock slam must ramp over several
+        # steps instead of one violent reversal. The policy's raw mu is still what
+        # Grad-CAPS regularizes; this is the hard backstop on the APPLIED steering.
+        if self.steer_rate > 0.0:
+            delta = max(-self.steer_rate, min(self.steer_rate,
+                                              requested_steer - self._rl_prev_steer))
+            steer = self._rl_prev_steer + delta
+            if abs(requested_steer - self._rl_prev_steer) > self.steer_rate:
+                self._steer_clip_steps += 1
+        else:
+            steer = requested_steer
+        self._rl_prev_steer = steer
+        self._cur_steer = steer   # APPLIED steer; read by the smoothness penalty + control
         thr = float(np.clip(action[1], -1.0, 1.0))
         self._cur_throttle = thr  # read by _compute_reward's throttle-smoothness
-        self._steer_stream.append(steer)   # run12 action-fluctuation logging (commanded)
+        self._steer_stream.append(steer)   # run12/13 fluctuation logging (APPLIED steer)
         self._thr_stream.append(thr)
         throttle = max(0.0, thr)
         brake = max(0.0, -thr)
@@ -590,6 +612,8 @@ class BeamNGRaceEnv(gymnasium.Env):
             "throttle_fluct": float(np.abs(np.diff(self._thr_stream)).mean()) if len(self._thr_stream) > 1 else 0.0,
             "steer_hf": _hf_energy_frac(self._steer_stream),
             "throttle_hf": _hf_energy_frac(self._thr_stream),
+            # run13 steering-rate-limit telemetry: fraction of steps the cap clipped.
+            "steer_clip_frac": float(self._steer_clip_steps / max(self._ep_steps, 1)),
         }
         return obs, reward + term_bonus, terminated, truncated, info
 
@@ -1010,9 +1034,9 @@ def _yaw_to_quat(yaw: float):
 def make_beamng_env(random_spawn: bool, home: Optional[str] = None,
                     host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                     launch: bool = False, headless: bool = False,
-                    nogpu: bool = False):
+                    nogpu: bool = False, steer_rate: float = 0.0):
     """Return a fresh BeamNGRaceEnv. No rtgym wrapping in v1."""
     return BeamNGRaceEnv(
         random_spawn=random_spawn, home=home, host=host, port=port,
-        launch=launch, headless=headless, nogpu=nogpu,
+        launch=launch, headless=headless, nogpu=nogpu, steer_rate=steer_rate,
     )

@@ -31,6 +31,7 @@ FREEZE_EPS = 5          # consecutive frozen episodes => freeze
 POLL_S = 20
 MAX_RESTARTS = 12
 CKPT_FREQ = 5000        # must match train_beamng --checkpoint-freq default
+WARM_LEARNING_STARTS = 5000   # self-heal: seed the (empty) replay buffer before training
 
 
 def monitor_csv(run): return f"logs/{run}/train.monitor.csv"
@@ -108,14 +109,20 @@ def crashed(run):
         return False
 
 
-def launch(run, timesteps, lr, warm, lambda_t):
+def launch(run, timesteps, lr, warm, lambda_t, steer_rate):
     """Launch a training segment as a child process, tee to console log."""
     os.makedirs("logs", exist_ok=True)
     cmd = [sys.executable, "train_beamng.py", "--run-name", run,
            "--timesteps", str(timesteps), "--nogpu", "--learning-rate", str(lr),
-           "--lambda-t", str(lambda_t)]
+           "--lambda-t", str(lambda_t), "--steer-rate", str(steer_rate)]
     if warm:
-        cmd += ["--warm-start", warm, "--learning-starts", "0"]
+        # WARM_LEARNING_STARTS > batch_size (256): on a self-heal the replay buffer
+        # starts EMPTY (not saved), so learning_starts=0 made SAC's first train()
+        # sample 256 copies of ~1 transition -> degenerate gradient that destroyed
+        # the loaded policy (run12 self-heal dumped reward 160 -> -20). Seeding the
+        # buffer with WARM_LEARNING_STARTS fresh transitions before any gradient step
+        # fixes it; the loaded networks are preserved through the short warmup.
+        cmd += ["--warm-start", warm, "--learning-starts", str(WARM_LEARNING_STARTS)]
     log = open(console_log(run), "w")
     # new session so our signals are scoped; train_beamng manages its own BeamNG
     p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
@@ -136,6 +143,7 @@ def main():
     ap.add_argument("--lr", default="1e-4")
     ap.add_argument("--warm", default=None)
     ap.add_argument("--lambda-t", type=float, default=1.0)
+    ap.add_argument("--steer-rate", type=float, default=0.0)
     args = ap.parse_args()
 
     done = 0
@@ -146,7 +154,7 @@ def main():
         remaining = args.total - done
         print(f"[supervisor] segment {seg}: run={run} remaining={remaining} "
               f"warm={warm or 'FRESH'}", flush=True)
-        p, log = launch(run, remaining, args.lr, warm, args.lambda_t)
+        p, log = launch(run, remaining, args.lr, warm, args.lambda_t, args.steer_rate)
 
         outcome = None
         while True:
