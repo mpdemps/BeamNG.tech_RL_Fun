@@ -134,6 +134,9 @@ def parse_args():
     p.add_argument("--steer-rate", type=float, default=0.0,
                    help="run13 steering slew-rate limit: symmetric cap on |Δsteer|/"
                         "step (action[0]). 0.0 = OFF; run13 uses 0.5.")
+    p.add_argument("--esc-min", type=float, default=1.0,
+                   help="run14 ESC throttle floor: cut applied throttle on lateral "
+                        "slip-angle down to this floor. 1.0 = OFF; run14 uses 0.1.")
     return p.parse_args()
 
 
@@ -182,7 +185,8 @@ def main():
                          "mean_speed", "max_arc", "min_heading_align",
                          "max_slip", "tc_cut_frac", "tc_cut_mean",
                          "steer_fluct", "throttle_fluct", "steer_hf", "throttle_hf",
-                         "steer_clip_frac")
+                         "steer_clip_frac",
+                         "esc_cut_frac", "beta_max", "beta_mean")
     train_env = Monitor(
         make_beamng_env(
             # Curriculum: fixed start at the start/finish line (idx=0) every
@@ -190,7 +194,7 @@ def main():
             # further each time. (random_spawn=False -> idx=0, heading 0, rest.)
             random_spawn=False, home=args.home, host=args.host, port=args.port,
             launch=args.launch, headless=args.headless, nogpu=args.nogpu,
-            steer_rate=args.steer_rate,
+            steer_rate=args.steer_rate, esc_min=args.esc_min,
         ),
         filename=str(log_dir / "train"),
         info_keywords=monitor_info_keys,
@@ -201,7 +205,7 @@ def main():
     eval_env = make_beamng_env(
         random_spawn=False, home=args.home, host=args.host, port=args.port,
         launch=False, headless=args.headless, nogpu=args.nogpu,
-        steer_rate=args.steer_rate,
+        steer_rate=args.steer_rate, esc_min=args.esc_min,
     )
 
     # SAC with SB3 sensible defaults for continuous control. buffer_size 1M holds

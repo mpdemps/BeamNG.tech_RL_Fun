@@ -145,6 +145,22 @@ SPIN_WEIGHT = 0.05
 TC_SLIP_DEAD = 4.0
 TC_SLIP_FULL = 7.0
 TC_MIN_THR = 0.1
+# run14 ESC (electronic stability control): cut throttle on lateral SLIP-ANGLE
+# beta -- the axis TC misses. TC watches longitudinal wheelspin; in all three
+# run13 spins rear slip stayed <4 (TC never fired) while the car slid sideways at
+# beta 17-46deg. Clean tracking sits at beta p90 ~5deg, so DEAD=9 leaves clean
+# cornering uncut; FULL=22 is deep oversteer, below the 25-46deg full-spin band.
+# esc_factor scales applied throttle from 1.0 (beta<=DEAD) down to the env's
+# esc_min floor (beta>=FULL). Multiplicative with tc_factor; cut-throttle-only.
+ESC_BETA_DEAD = 9.0
+ESC_BETA_FULL = 22.0
+# ESC speed floor: below this, slip-angle beta is just velocity-vector noise (a tiny
+# lateral component at low speed reads as a large angle) and a low-speed slide is
+# harmless -- while the standing start NEEDS full throttle. So beta is pinned to 0
+# below the floor (ESC off). Every corner is >=17 m/s and every measured spin was
+# 25-36 m/s, so an 8 m/s floor costs zero corner coverage. (run14 smoke caught ESC
+# strangling the launch without this.)
+ESC_MIN_SPEED_M_S = 8.0
 # Heading kill-switch (run5): the reward was heading-BLIND -- it gated on
 # velocity-vs-tangent but never on which way the nose points, so a spun-out car
 # sliding/coasting down-track earned full progress + speed + checkpoint reward
@@ -318,7 +334,8 @@ class BeamNGRaceEnv(gymnasium.Env):
     def __init__(self, random_spawn: bool, home: Optional[str] = None,
                  host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                  launch: bool = False, headless: bool = False,
-                 nogpu: bool = False, steer_rate: float = 0.0):
+                 nogpu: bool = False, steer_rate: float = 0.0,
+                 esc_min: float = 1.0):
         super().__init__()
         # Connection params are stored here; we actually open BeamNG lazily
         # in reset(), so constructing the env never fails on its own.
@@ -334,6 +351,11 @@ class BeamNGRaceEnv(gymnasium.Env):
         # run that does not explicitly enable it (protects the concurrently-running
         # run12 if it self-heals and re-imports this module). run13 sets 0.5.
         self.steer_rate = steer_rate
+        # run14 ESC throttle cut on lateral slip-angle. 1.0 = OFF (esc_factor is
+        # clamped to [esc_min, 1.0], so esc_min=1.0 -> always 1.0 -> no cut), same
+        # protective default-off pattern as steer_rate. run14 sets 0.1 (a floor so
+        # the car never fully bogs mid-slide).
+        self.esc_min = esc_min
 
         # 15 = speed + heading_err + center_off + 6 lookahead points x (dist,
         # bearing). NOTE: this shape change makes pre-run6 models unloadable
@@ -373,6 +395,10 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._max_slip = 0.0
         self._tc_cut_sum = 0.0       # run11 TC: episode sum of (requested-applied) throttle
         self._tc_cut_steps = 0       # run11 TC: episode count of steps TC cut throttle
+        self._last_beta = 0.0        # run14 ESC: last-step lateral slip angle (deg)
+        self._max_beta = 0.0         # run14 ESC telemetry: episode max slip angle
+        self._beta_sum = 0.0         # run14 ESC telemetry: for episode-mean slip angle
+        self._esc_cut_steps = 0      # run14 ESC: episode count of steps ESC cut throttle
         self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
         self._thr_stream = []
         self._rl_prev_steer = 0.0    # run13: last APPLIED steer (rate-limit ramps from here)
@@ -517,6 +543,10 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._max_slip = 0.0
         self._tc_cut_sum = 0.0       # run11 TC: episode sum of (requested-applied) throttle
         self._tc_cut_steps = 0       # run11 TC: episode count of steps TC cut throttle
+        self._last_beta = 0.0        # run14 ESC: last-step lateral slip angle (deg)
+        self._max_beta = 0.0         # run14 ESC telemetry: episode max slip angle
+        self._beta_sum = 0.0         # run14 ESC telemetry: for episode-mean slip angle
+        self._esc_cut_steps = 0      # run14 ESC: episode count of steps ESC cut throttle
         self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
         self._thr_stream = []
         self._rl_prev_steer = 0.0    # run13: last APPLIED steer (rate-limit ramps from here)
@@ -554,11 +584,25 @@ class BeamNGRaceEnv(gymnasium.Env):
         # keep flooring; the car physically cannot dump spin-inducing power.
         tc_factor = max(TC_MIN_THR, min(1.0, 1.0 - (self._last_slip - TC_SLIP_DEAD)
                                         / (TC_SLIP_FULL - TC_SLIP_DEAD)))
-        applied_throttle = throttle * tc_factor
+        # run14 ESC: cut throttle on lateral slip-angle (orthogonal axis to TC's
+        # wheelspin -- TC never fired in the run13 spins). Uses last-step beta
+        # (one-step lag like TC; beta leads the spin so this is fine). esc_min=1.0
+        # -> esc_factor pinned to 1.0 -> OFF. Cut-throttle-only; the brake path
+        # below is untouched. Multiplicative with tc_factor: the tighter of the two
+        # grip constraints dominates, they never fight.
+        if self.esc_min < 1.0:
+            esc_factor = max(self.esc_min, min(1.0, 1.0 - (self._last_beta - ESC_BETA_DEAD)
+                                               / (ESC_BETA_FULL - ESC_BETA_DEAD)))
+        else:
+            esc_factor = 1.0
+        applied_throttle = throttle * tc_factor * esc_factor
         # TC-cut telemetry (logged as episode aggregates): how much / how often.
         self._tc_cut_sum += (throttle - applied_throttle)
         if throttle > 0.01 and tc_factor < 0.999:
             self._tc_cut_steps += 1
+        # run14 ESC-cut telemetry: count steps the slip-angle gate cut throttle.
+        if throttle > 0.01 and esc_factor < 0.999:
+            self._esc_cut_steps += 1
         _shared["vehicle"].control(steering=steer, throttle=applied_throttle,
                                    brake=brake)
 
@@ -614,6 +658,12 @@ class BeamNGRaceEnv(gymnasium.Env):
             "throttle_hf": _hf_energy_frac(self._thr_stream),
             # run13 steering-rate-limit telemetry: fraction of steps the cap clipped.
             "steer_clip_frac": float(self._steer_clip_steps / max(self._ep_steps, 1)),
+            # run14 ESC telemetry: fraction of steps the slip-angle gate cut throttle,
+            # plus the episode's max/mean slip angle (deg) -- so we can confirm ESC
+            # fires on slides (beta high) and not on clean driving (beta < BETA_DEAD).
+            "esc_cut_frac": float(self._esc_cut_steps / max(self._ep_steps, 1)),
+            "beta_max": float(self._max_beta),
+            "beta_mean": float(self._beta_sum / max(self._ep_steps, 1)),
         }
         return obs, reward + term_bonus, terminated, truncated, info
 
@@ -776,6 +826,19 @@ class BeamNGRaceEnv(gymnasium.Env):
         hn = math.sqrt(fdir[0] ** 2 + fdir[1] ** 2)
         heading_align = (fdir[0] * fx + fdir[1] * fy) / hn if hn > 1e-6 else 1.0
         self._last_heading_align = heading_align
+        # run14 ESC: lateral slip angle beta (deg) = angle between the velocity
+        # vector and the nose (dir). This is the axis TC never watched -- the rear
+        # slides sideways while longitudinal wheelspin stays low. Computed here,
+        # before the kill-switch return, so BOTH paths leave a fresh value for next
+        # step's throttle gate (one-step lag, like TC). Pinned to 0 below the ESC
+        # speed floor (noise at low speed; the launch needs throttle) and at standstill.
+        if speed_horizontal < ESC_MIN_SPEED_M_S or hn < 1e-6:
+            self._last_beta = 0.0
+        else:
+            cos_b = (vel[0] * fdir[0] + vel[1] * fdir[1]) / (speed_horizontal * hn)
+            self._last_beta = math.degrees(math.acos(max(-1.0, min(1.0, cos_b))))
+        self._max_beta = max(self._max_beta, self._last_beta)
+        self._beta_sum += self._last_beta
         if heading_align < HEADING_KILL_THRESHOLD:
             self._backward_steps += 1
         else:
@@ -1034,9 +1097,11 @@ def _yaw_to_quat(yaw: float):
 def make_beamng_env(random_spawn: bool, home: Optional[str] = None,
                     host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                     launch: bool = False, headless: bool = False,
-                    nogpu: bool = False, steer_rate: float = 0.0):
+                    nogpu: bool = False, steer_rate: float = 0.0,
+                    esc_min: float = 1.0):
     """Return a fresh BeamNGRaceEnv. No rtgym wrapping in v1."""
     return BeamNGRaceEnv(
         random_spawn=random_spawn, home=home, host=host, port=port,
         launch=launch, headless=headless, nogpu=nogpu, steer_rate=steer_rate,
+        esc_min=esc_min,
     )
