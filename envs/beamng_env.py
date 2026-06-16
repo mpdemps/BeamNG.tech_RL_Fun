@@ -161,6 +161,19 @@ ESC_BETA_FULL = 22.0
 # 25-36 m/s, so an 8 m/s floor costs zero corner coverage. (run14 smoke caught ESC
 # strangling the launch without this.)
 ESC_MIN_SPEED_M_S = 8.0
+# run15 speed-scaled steering RATE limit: the proactive complement to ESC. ESC cuts
+# throttle reactively once the rear is already sliding (too late for a full-lock
+# reversal at speed). The spin is a REVERSAL (a rate phenomenon), while a fast corner
+# is SUSTAINED lock (low rate) -- so tightening the run13 steering-rate cap with speed
+# blocks the violent reversal WITHOUT capping the lock the fast corners hold. This is
+# why a rate limit beats a magnitude cap here: the fastest corners (T2 ~31, T7 ~34, T9
+# ~35 m/s) live IN the 33-36 m/s spin band, so a magnitude cap could not separate
+# corner (~0.6 lock) from slam (~0.9-1.0) without starving the corner; a rate limit
+# separates them by HOW FAST the wheel moves instead. Effective rate = steer_rate at
+# /below V_LO (full agility), linear taper to the env's steer_rate_hi by V_HI, flat
+# above. steer_rate_hi<0 => OFF (flat steer_rate, default). Uses last-step speed.
+STEER_RATE_V_LO = 27.0
+STEER_RATE_V_HI = 31.0
 # Heading kill-switch (run5): the reward was heading-BLIND -- it gated on
 # velocity-vs-tangent but never on which way the nose points, so a spun-out car
 # sliding/coasting down-track earned full progress + speed + checkpoint reward
@@ -335,7 +348,7 @@ class BeamNGRaceEnv(gymnasium.Env):
                  host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                  launch: bool = False, headless: bool = False,
                  nogpu: bool = False, steer_rate: float = 0.0,
-                 esc_min: float = 1.0):
+                 esc_min: float = 1.0, steer_rate_hi: float = -1.0):
         super().__init__()
         # Connection params are stored here; we actually open BeamNG lazily
         # in reset(), so constructing the env never fails on its own.
@@ -356,6 +369,11 @@ class BeamNGRaceEnv(gymnasium.Env):
         # protective default-off pattern as steer_rate. run14 sets 0.1 (a floor so
         # the car never fully bogs mid-slide).
         self.esc_min = esc_min
+        # run15 speed-scaled steering-rate floor: the tightened |Δsteer|/step cap at
+        # high speed (the rate the taper reaches by V_HI). <0 = OFF (flat steer_rate at
+        # all speeds), same protective default-off pattern. run15 sets ~0.15 to slow the
+        # high-speed reversal while corners (sustained lock) are barely affected.
+        self.steer_rate_hi = steer_rate_hi
 
         # 15 = speed + heading_err + center_off + 6 lookahead points x (dist,
         # bearing). NOTE: this shape change makes pre-run6 models unloadable
@@ -403,6 +421,8 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._thr_stream = []
         self._rl_prev_steer = 0.0    # run13: last APPLIED steer (rate-limit ramps from here)
         self._steer_clip_steps = 0   # run13: episode count of steps the steer-rate clipped
+        self._last_speed_h = 0.0     # run15: last-step speed for the authority cap
+        self._steer_ratehi_steps = 0 # run15: steps the speed-tightened rate actively bound
         # Steering smoothness tracker (run2): _cur_steer is this tick's steer,
         # _prev_steer last tick's; their difference drives smoothness_penalty.
         # run6 adds the same for throttle/brake (action[1]).
@@ -551,6 +571,8 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._thr_stream = []
         self._rl_prev_steer = 0.0    # run13: last APPLIED steer (rate-limit ramps from here)
         self._steer_clip_steps = 0   # run13: episode count of steps the steer-rate clipped
+        self._last_speed_h = 0.0     # run15: last-step speed for the authority cap
+        self._steer_ratehi_steps = 0 # run15: steps the speed-tightened rate actively bound
         return self._get_observation(), {}
 
     def step(self, action):
@@ -562,12 +584,29 @@ class BeamNGRaceEnv(gymnasium.Env):
         # cap |Δsteer|/step symmetrically so a full-lock slam must ramp over several
         # steps instead of one violent reversal. The policy's raw mu is still what
         # Grad-CAPS regularizes; this is the hard backstop on the APPLIED steering.
+        # run15 makes this cap SPEED-SCALED: tighten the rate from steer_rate (at/below
+        # V_LO, full corner agility) to steer_rate_hi (by V_HI) so a high-speed reversal
+        # must ramp slowly while a sustained corner (low rate) is barely touched. The
+        # fastest corners live in the spin band, so a rate taper -- not a magnitude cap
+        # -- separates corner from slam. steer_rate_hi<0 => flat steer_rate (OFF).
         if self.steer_rate > 0.0:
-            delta = max(-self.steer_rate, min(self.steer_rate,
-                                              requested_steer - self._rl_prev_steer))
+            rate = self.steer_rate
+            if 0.0 <= self.steer_rate_hi < self.steer_rate:
+                v = self._last_speed_h
+                if v >= STEER_RATE_V_HI:
+                    rate = self.steer_rate_hi
+                elif v > STEER_RATE_V_LO:
+                    rate = self.steer_rate - ((v - STEER_RATE_V_LO)
+                                              / (STEER_RATE_V_HI - STEER_RATE_V_LO)
+                                              * (self.steer_rate - self.steer_rate_hi))
+            req_delta = requested_steer - self._rl_prev_steer
+            delta = max(-rate, min(rate, req_delta))
             steer = self._rl_prev_steer + delta
-            if abs(requested_steer - self._rl_prev_steer) > self.steer_rate:
+            if abs(req_delta) > rate:
                 self._steer_clip_steps += 1
+                # the speed-tightened rate (below base) is what actively bound this step
+                if rate < self.steer_rate - 1e-9:
+                    self._steer_ratehi_steps += 1
         else:
             steer = requested_steer
         self._rl_prev_steer = steer
@@ -664,6 +703,10 @@ class BeamNGRaceEnv(gymnasium.Env):
             "esc_cut_frac": float(self._esc_cut_steps / max(self._ep_steps, 1)),
             "beta_max": float(self._max_beta),
             "beta_mean": float(self._beta_sum / max(self._ep_steps, 1)),
+            # run15 speed-scaled-rate telemetry: fraction of steps the SPEED-TIGHTENED
+            # rate (below base steer_rate) actively bound -- nonzero only at speed on a
+            # fast reversal, ~0 at corner speeds / sustained cornering.
+            "steer_ratehi_frac": float(self._steer_ratehi_steps / max(self._ep_steps, 1)),
         }
         return obs, reward + term_bonus, terminated, truncated, info
 
@@ -803,6 +846,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         s = _shared["vehicle"].sensors["agent_state"]
         vel = s["vel"]
         speed_horizontal = math.sqrt(vel[0] ** 2 + vel[1] ** 2)
+        self._last_speed_h = speed_horizontal   # run15: last-step speed for the authority cap
 
         # Track tangent at the car's current centerline index, used by BOTH the
         # velocity alignment and the run5 heading gate.
@@ -1098,10 +1142,10 @@ def make_beamng_env(random_spawn: bool, home: Optional[str] = None,
                     host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                     launch: bool = False, headless: bool = False,
                     nogpu: bool = False, steer_rate: float = 0.0,
-                    esc_min: float = 1.0):
+                    esc_min: float = 1.0, steer_rate_hi: float = -1.0):
     """Return a fresh BeamNGRaceEnv. No rtgym wrapping in v1."""
     return BeamNGRaceEnv(
         random_spawn=random_spawn, home=home, host=host, port=port,
         launch=launch, headless=headless, nogpu=nogpu, steer_rate=steer_rate,
-        esc_min=esc_min,
+        esc_min=esc_min, steer_rate_hi=steer_rate_hi,
     )
