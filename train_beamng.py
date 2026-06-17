@@ -28,8 +28,7 @@ import datetime
 import os
 from pathlib import Path
 
-from stable_baselines3 import SAC
-from gradcaps_sac import GradCapsSAC  # run12: SAC + Grad-CAPS actor-loss smoothness
+from stable_baselines3 import SAC  # run16: plain SAC (Grad-CAPS dropped in the paradigm reset)
 from stable_baselines3.common.callbacks import (
     BaseCallback, CheckpointCallback, EvalCallback)
 from stable_baselines3.common.monitor import Monitor
@@ -128,19 +127,10 @@ def parse_args():
                    help="Random-action steps before learning. Set 0 for "
                         "warm-start so the LOADED policy drives from step 0 "
                         "(SAC takes random actions during these steps).")
-    p.add_argument("--lambda-t", type=float, default=1.0,
-                   help="run12 Grad-CAPS temporal action-smoothness weight in the "
-                        "actor loss. 0 disables (plain SAC).")
     p.add_argument("--steer-rate", type=float, default=0.0,
-                   help="run13 steering slew-rate limit: symmetric cap on |Δsteer|/"
-                        "step (action[0]). 0.0 = OFF; run13 uses 0.5.")
-    p.add_argument("--esc-min", type=float, default=1.0,
-                   help="run14 ESC throttle floor: cut applied throttle on lateral "
-                        "slip-angle down to this floor. 1.0 = OFF; run14 uses 0.1.")
-    p.add_argument("--steer-rate-hi", type=float, default=-1.0,
-                   help="run15 speed-scaled steering-rate floor: the tightened |Δsteer|/"
-                        "step cap reached at high speed (taper from --steer-rate). "
-                        "<0 = OFF (flat steer-rate); run15 uses ~0.15.")
+                   help="run13/16 steering slew-rate limit: flat symmetric cap on "
+                        "|Δsteer|/step (action[0]). 0.0 = OFF; run16 uses 0.5 (the one "
+                        "retained scripted constraint).")
     return p.parse_args()
 
 
@@ -180,18 +170,18 @@ def main():
     # Monitor logs ep-end values of the listed info-dict keys to a CSV
     # alongside the standard r/l/t columns. NOTE: this is per-EPISODE-END,
     # not per-step — for true per-step CSV we'd need a custom callback.
+    # run16: 'speed_reward' diag slot now carries the over-speed penalty, 'spin_penalty'
+    # the slip-angle penalty (see env _compute_reward). over_speed_mean + beta are the
+    # learn-to-corner watch signals; tc/esc/gradcaps/fluct telemetry retired with them.
     monitor_info_keys = ("raw_progress", "alignment", "final_reward",
-                         "speed_reward", "smoothness_penalty",
-                         "throttle_smooth_penalty",
-                         "slip", "spin_penalty", "heading_align",
+                         "speed_reward", "spin_penalty",
+                         "slip", "heading_align",
                          "checkpoints_reached",
                          "termination_reason", "recovered_count",
                          "mean_speed", "max_arc", "min_heading_align",
-                         "max_slip", "tc_cut_frac", "tc_cut_mean",
-                         "steer_fluct", "throttle_fluct", "steer_hf", "throttle_hf",
-                         "steer_clip_frac",
-                         "esc_cut_frac", "beta_max", "beta_mean",
-                         "steer_ratehi_frac")
+                         "max_slip", "steer_clip_frac",
+                         "beta_max", "beta_mean",
+                         "over_speed_mean", "v_target_here")
     train_env = Monitor(
         make_beamng_env(
             # Curriculum: fixed start at the start/finish line (idx=0) every
@@ -199,8 +189,7 @@ def main():
             # further each time. (random_spawn=False -> idx=0, heading 0, rest.)
             random_spawn=False, home=args.home, host=args.host, port=args.port,
             launch=args.launch, headless=args.headless, nogpu=args.nogpu,
-            steer_rate=args.steer_rate, esc_min=args.esc_min,
-            steer_rate_hi=args.steer_rate_hi,
+            steer_rate=args.steer_rate,
         ),
         filename=str(log_dir / "train"),
         info_keywords=monitor_info_keys,
@@ -211,8 +200,7 @@ def main():
     eval_env = make_beamng_env(
         random_spawn=False, home=args.home, host=args.host, port=args.port,
         launch=False, headless=args.headless, nogpu=args.nogpu,
-        steer_rate=args.steer_rate, esc_min=args.esc_min,
-        steer_rate_hi=args.steer_rate_hi,
+        steer_rate=args.steer_rate,
     )
 
     # SAC with SB3 sensible defaults for continuous control. buffer_size 1M holds
@@ -241,10 +229,9 @@ def main():
         # usual random-action warmup -- the proof the warm-start took.
         if not os.path.isfile(args.warm_start):
             raise SystemExit(f"--warm-start file not found: {args.warm_start}")
-        print(f"WARM-START: GradCapsSAC.load({args.warm_start})  "
-              f"lr={args.learning_rate}  learning_starts={args.learning_starts}  "
-              f"lambda_t={args.lambda_t}", flush=True)
-        model = GradCapsSAC.load(
+        print(f"WARM-START: SAC.load({args.warm_start})  "
+              f"lr={args.learning_rate}  learning_starts={args.learning_starts}", flush=True)
+        model = SAC.load(
             args.warm_start,
             env=train_env,
             device="cpu",
@@ -255,18 +242,13 @@ def main():
             learning_starts=args.learning_starts,
             tensorboard_log=str(log_dir),
         )
-        # load() doesn't pass our custom __init__ args through; set them explicitly.
-        model.lambda_t = args.lambda_t
-        model.gradcaps_batch = 256
     else:
-        model = GradCapsSAC(
+        model = SAC(
             "MlpPolicy",
             train_env,
             verbose=1,
             tensorboard_log=str(log_dir),
             device="cpu",
-            lambda_t=args.lambda_t,
-            gradcaps_batch=256,
             **hyperparams,
         )
 

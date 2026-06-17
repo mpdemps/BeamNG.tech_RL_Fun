@@ -109,13 +109,12 @@ def crashed(run):
         return False
 
 
-def launch(run, timesteps, lr, warm, lambda_t, steer_rate, esc_min, steer_rate_hi):
+def launch(run, timesteps, lr, warm, steer_rate):
     """Launch a training segment as a child process, tee to console log."""
     os.makedirs("logs", exist_ok=True)
     cmd = [sys.executable, "train_beamng.py", "--run-name", run,
            "--timesteps", str(timesteps), "--nogpu", "--learning-rate", str(lr),
-           "--lambda-t", str(lambda_t), "--steer-rate", str(steer_rate),
-           "--esc-min", str(esc_min), "--steer-rate-hi", str(steer_rate_hi)]
+           "--steer-rate", str(steer_rate)]
     if warm:
         # WARM_LEARNING_STARTS > batch_size (256): on a self-heal the replay buffer
         # starts EMPTY (not saved), so learning_starts=0 made SAC's first train()
@@ -143,10 +142,7 @@ def main():
     ap.add_argument("--total", type=int, required=True)
     ap.add_argument("--lr", default="1e-4")
     ap.add_argument("--warm", default=None)
-    ap.add_argument("--lambda-t", type=float, default=1.0)
     ap.add_argument("--steer-rate", type=float, default=0.0)
-    ap.add_argument("--esc-min", type=float, default=1.0)
-    ap.add_argument("--steer-rate-hi", type=float, default=-1.0)
     args = ap.parse_args()
 
     done = 0
@@ -157,8 +153,7 @@ def main():
         remaining = args.total - done
         print(f"[supervisor] segment {seg}: run={run} remaining={remaining} "
               f"warm={warm or 'FRESH'}", flush=True)
-        p, log = launch(run, remaining, args.lr, warm, args.lambda_t, args.steer_rate,
-                        args.esc_min, args.steer_rate_hi)
+        p, log = launch(run, remaining, args.lr, warm, args.steer_rate)
 
         outcome = None
         while True:

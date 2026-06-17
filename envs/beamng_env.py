@@ -257,6 +257,24 @@ DEFAULT_PORT = 25252
 # the built-in data ever proves wrong.
 # from data.centerline_racetrack import CENTERLINE  # original manual recording
 from data.centerline_racetrack_builtin import CENTERLINE
+from envs.speed_profile import compute_speed_profile, V_MAX as PROFILE_V_MAX
+
+# run16 paradigm reset: braking-aware target-speed profile, computed once over the
+# centerline (index-aligned with CENTERLINE / _cum_arc). The reward rewards matching it
+# (slow-in) and the obs exposes it; this is what makes BRAKING emerge instead of being
+# scripted. See docs/mikey_run16_plan_learn_to_corner.md + envs/speed_profile.py.
+V_TARGET_PROFILE, _PROFILE_R, _PROFILE_ARC, _PROFILE_TRACKLEN, _PROFILE_KAPPA = \
+    compute_speed_profile(CENTERLINE)
+
+# run16 reward weights (calibrated in the smoke per the W_OVER/W_PROG gate).
+W_PROG = 1.0           # progress * alignment (cover the track, forward only)
+W_OVER = 0.05          # over-speed penalty: -W_OVER * max(0, v - (v_target - offset))^2
+W_SLIP = 0.05          # slip-angle penalty: -W_SLIP * max(0, |beta_deg| - BETA_SLIP_DEAD)
+OVER_SPEED_OFFSET = 0.0  # m/s; start the over-speed penalty this far BELOW v_target so the
+                         # gradient is nonzero AT target (fixes the zero-gradient margin).
+                         # 0 = off; raise in the smoke if reward-optimal speed runs hot.
+BETA_SLIP_DEAD = 9.0   # deg; clean tracking p90 ~5deg, slides 17-46deg
+CURV_PREVIEW_KAPPA_SCALE = 0.04  # 1/m; obs curvature-preview normalization (R~25m -> ~1.0)
 
 
 # One BeamNG connection shared by both the training env and the eval env.
@@ -347,8 +365,7 @@ class BeamNGRaceEnv(gymnasium.Env):
     def __init__(self, random_spawn: bool, home: Optional[str] = None,
                  host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                  launch: bool = False, headless: bool = False,
-                 nogpu: bool = False, steer_rate: float = 0.0,
-                 esc_min: float = 1.0, steer_rate_hi: float = -1.0):
+                 nogpu: bool = False, steer_rate: float = 0.0):
         super().__init__()
         # Connection params are stored here; we actually open BeamNG lazily
         # in reset(), so constructing the env never fails on its own.
@@ -364,22 +381,12 @@ class BeamNGRaceEnv(gymnasium.Env):
         # run that does not explicitly enable it (protects the concurrently-running
         # run12 if it self-heals and re-imports this module). run13 sets 0.5.
         self.steer_rate = steer_rate
-        # run14 ESC throttle cut on lateral slip-angle. 1.0 = OFF (esc_factor is
-        # clamped to [esc_min, 1.0], so esc_min=1.0 -> always 1.0 -> no cut), same
-        # protective default-off pattern as steer_rate. run14 sets 0.1 (a floor so
-        # the car never fully bogs mid-slide).
-        self.esc_min = esc_min
-        # run15 speed-scaled steering-rate floor: the tightened |Δsteer|/step cap at
-        # high speed (the rate the taper reaches by V_HI). <0 = OFF (flat steer_rate at
-        # all speeds), same protective default-off pattern. run15 sets ~0.15 to slow the
-        # high-speed reversal while corners (sustained lock) are barely affected.
-        self.steer_rate_hi = steer_rate_hi
 
-        # 15 = speed + heading_err + center_off + 6 lookahead points x (dist,
-        # bearing). NOTE: this shape change makes pre-run6 models unloadable
-        # against this env (watch old runs by checking out the pre-run6 commit).
+        # 18 = speed + heading_err + center_off + 6 lookahead x (dist,bearing) + run16's
+        # [15] signed curvature preview, [16] v_target/V_MAX, [17] slip-angle (beta).
+        # NOTE: shape change -> pre-run16 models unloadable against this env.
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(15,), dtype=np.float32)
+            low=-1.0, high=1.0, shape=(18,), dtype=np.float32)
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
@@ -411,18 +418,14 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._max_arc = 0.0
         self._min_heading_align = 1.0
         self._max_slip = 0.0
-        self._tc_cut_sum = 0.0       # run11 TC: episode sum of (requested-applied) throttle
-        self._tc_cut_steps = 0       # run11 TC: episode count of steps TC cut throttle
-        self._last_beta = 0.0        # run14 ESC: last-step lateral slip angle (deg)
-        self._max_beta = 0.0         # run14 ESC telemetry: episode max slip angle
-        self._beta_sum = 0.0         # run14 ESC telemetry: for episode-mean slip angle
-        self._esc_cut_steps = 0      # run14 ESC: episode count of steps ESC cut throttle
+        self._last_beta = 0.0        # run14/16: last-step slip angle (deg); feeds obs + slip penalty
+        self._max_beta = 0.0         # telemetry: episode max slip angle
+        self._beta_sum = 0.0         # telemetry: for episode-mean slip angle
+        self._over_speed_sum = 0.0   # run16 telemetry: sum of max(0, v - v_target) per step
         self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
         self._thr_stream = []
         self._rl_prev_steer = 0.0    # run13: last APPLIED steer (rate-limit ramps from here)
         self._steer_clip_steps = 0   # run13: episode count of steps the steer-rate clipped
-        self._last_speed_h = 0.0     # run15: last-step speed for the authority cap
-        self._steer_ratehi_steps = 0 # run15: steps the speed-tightened rate actively bound
         # Steering smoothness tracker (run2): _cur_steer is this tick's steer,
         # _prev_steer last tick's; their difference drives smoothness_penalty.
         # run6 adds the same for throttle/brake (action[1]).
@@ -561,18 +564,14 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._max_arc = 0.0
         self._min_heading_align = 1.0
         self._max_slip = 0.0
-        self._tc_cut_sum = 0.0       # run11 TC: episode sum of (requested-applied) throttle
-        self._tc_cut_steps = 0       # run11 TC: episode count of steps TC cut throttle
-        self._last_beta = 0.0        # run14 ESC: last-step lateral slip angle (deg)
-        self._max_beta = 0.0         # run14 ESC telemetry: episode max slip angle
-        self._beta_sum = 0.0         # run14 ESC telemetry: for episode-mean slip angle
-        self._esc_cut_steps = 0      # run14 ESC: episode count of steps ESC cut throttle
+        self._last_beta = 0.0        # run14/16: last-step slip angle (deg); feeds obs + slip penalty
+        self._max_beta = 0.0         # telemetry: episode max slip angle
+        self._beta_sum = 0.0         # telemetry: for episode-mean slip angle
+        self._over_speed_sum = 0.0   # run16 telemetry: sum of max(0, v - v_target) per step
         self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
         self._thr_stream = []
         self._rl_prev_steer = 0.0    # run13: last APPLIED steer (rate-limit ramps from here)
         self._steer_clip_steps = 0   # run13: episode count of steps the steer-rate clipped
-        self._last_speed_h = 0.0     # run15: last-step speed for the authority cap
-        self._steer_ratehi_steps = 0 # run15: steps the speed-tightened rate actively bound
         return self._get_observation(), {}
 
     def step(self, action):
@@ -580,70 +579,30 @@ class BeamNGRaceEnv(gymnasium.Env):
         # action[0] -> steering in [-1, 1]
         # action[1] -> throttle (>0) or brake (<0)
         requested_steer = float(np.clip(action[0], -1.0, 1.0))
-        # run13 steering slew-rate limit (gated; steer_rate=0 -> OFF, no change):
-        # cap |Δsteer|/step symmetrically so a full-lock slam must ramp over several
-        # steps instead of one violent reversal. The policy's raw mu is still what
-        # Grad-CAPS regularizes; this is the hard backstop on the APPLIED steering.
-        # run15 makes this cap SPEED-SCALED: tighten the rate from steer_rate (at/below
-        # V_LO, full corner agility) to steer_rate_hi (by V_HI) so a high-speed reversal
-        # must ramp slowly while a sustained corner (low rate) is barely touched. The
-        # fastest corners live in the spin band, so a rate taper -- not a magnitude cap
-        # -- separates corner from slam. steer_rate_hi<0 => flat steer_rate (OFF).
+        # run16: the ONE retained scripted constraint -- a FLAT steering slew-rate limit
+        # (steer_rate=0.5). Caps |Δsteer|/step symmetrically so a full-lock slam ramps over
+        # several steps. The run15 speed-scaling is gone (the reward now teaches the speed/
+        # line that the speed-taper was patching). steer_rate=0 -> OFF.
         if self.steer_rate > 0.0:
-            rate = self.steer_rate
-            if 0.0 <= self.steer_rate_hi < self.steer_rate:
-                v = self._last_speed_h
-                if v >= STEER_RATE_V_HI:
-                    rate = self.steer_rate_hi
-                elif v > STEER_RATE_V_LO:
-                    rate = self.steer_rate - ((v - STEER_RATE_V_LO)
-                                              / (STEER_RATE_V_HI - STEER_RATE_V_LO)
-                                              * (self.steer_rate - self.steer_rate_hi))
             req_delta = requested_steer - self._rl_prev_steer
-            delta = max(-rate, min(rate, req_delta))
+            delta = max(-self.steer_rate, min(self.steer_rate, req_delta))
             steer = self._rl_prev_steer + delta
-            if abs(req_delta) > rate:
+            if abs(req_delta) > self.steer_rate:
                 self._steer_clip_steps += 1
-                # the speed-tightened rate (below base) is what actively bound this step
-                if rate < self.steer_rate - 1e-9:
-                    self._steer_ratehi_steps += 1
         else:
             steer = requested_steer
         self._rl_prev_steer = steer
-        self._cur_steer = steer   # APPLIED steer; read by the smoothness penalty + control
+        self._cur_steer = steer   # APPLIED steer; read by control
         thr = float(np.clip(action[1], -1.0, 1.0))
-        self._cur_throttle = thr  # read by _compute_reward's throttle-smoothness
-        self._steer_stream.append(steer)   # run12/13 fluctuation logging (APPLIED steer)
+        self._cur_throttle = thr
+        self._steer_stream.append(steer)   # fluctuation logging (APPLIED steer)
         self._thr_stream.append(thr)
         throttle = max(0.0, thr)
         brake = max(0.0, -thr)
-        # run11 traction control: cap applied throttle on last-step rear slip (one
-        # 50ms-step sensor lag, like real TC). Below DEAD full power; DEAD..FULL
-        # scales down; >=FULL cut to TC_MIN_THR. Brake path untouched. The policy may
-        # keep flooring; the car physically cannot dump spin-inducing power.
-        tc_factor = max(TC_MIN_THR, min(1.0, 1.0 - (self._last_slip - TC_SLIP_DEAD)
-                                        / (TC_SLIP_FULL - TC_SLIP_DEAD)))
-        # run14 ESC: cut throttle on lateral slip-angle (orthogonal axis to TC's
-        # wheelspin -- TC never fired in the run13 spins). Uses last-step beta
-        # (one-step lag like TC; beta leads the spin so this is fine). esc_min=1.0
-        # -> esc_factor pinned to 1.0 -> OFF. Cut-throttle-only; the brake path
-        # below is untouched. Multiplicative with tc_factor: the tighter of the two
-        # grip constraints dominates, they never fight.
-        if self.esc_min < 1.0:
-            esc_factor = max(self.esc_min, min(1.0, 1.0 - (self._last_beta - ESC_BETA_DEAD)
-                                               / (ESC_BETA_FULL - ESC_BETA_DEAD)))
-        else:
-            esc_factor = 1.0
-        applied_throttle = throttle * tc_factor * esc_factor
-        # TC-cut telemetry (logged as episode aggregates): how much / how often.
-        self._tc_cut_sum += (throttle - applied_throttle)
-        if throttle > 0.01 and tc_factor < 0.999:
-            self._tc_cut_steps += 1
-        # run14 ESC-cut telemetry: count steps the slip-angle gate cut throttle.
-        if throttle > 0.01 and esc_factor < 0.999:
-            self._esc_cut_steps += 1
-        _shared["vehicle"].control(steering=steer, throttle=applied_throttle,
-                                   brake=brake)
+        # run16: NO throttle scripting. run11 TC + run14 ESC are dropped -- the policy now
+        # learns to brake/not-spin via the speed-target reward + slip-angle penalty, instead
+        # of having the throttle capped (which masked the consequence it must learn from).
+        _shared["vehicle"].control(steering=steer, throttle=throttle, brake=brake)
 
         # Advance 3 physics steps (~50 ms at 60 Hz).
         # TODO(v2 rtgym migration): replace this with rtgym's elastic
@@ -685,28 +644,14 @@ class BeamNGRaceEnv(gymnasium.Env):
             "max_arc": float(self._max_arc),
             "min_heading_align": float(self._min_heading_align),
             "max_slip": float(self._max_slip),
-            # run11 traction-control telemetry: how OFTEN TC cut (fraction of steps)
-            # and how MUCH on average (mean throttle reduction per step).
-            "tc_cut_frac": float(self._tc_cut_steps / max(self._ep_steps, 1)),
-            "tc_cut_mean": float(self._tc_cut_sum / max(self._ep_steps, 1)),
-            # run12 action-smoothness logging (Monitor logs the terminal step's value =
-            # the whole-episode figure): mean |Δaction| per axis + high-freq energy.
-            "steer_fluct": float(np.abs(np.diff(self._steer_stream)).mean()) if len(self._steer_stream) > 1 else 0.0,
-            "throttle_fluct": float(np.abs(np.diff(self._thr_stream)).mean()) if len(self._thr_stream) > 1 else 0.0,
-            "steer_hf": _hf_energy_frac(self._steer_stream),
-            "throttle_hf": _hf_energy_frac(self._thr_stream),
-            # run13 steering-rate-limit telemetry: fraction of steps the cap clipped.
             "steer_clip_frac": float(self._steer_clip_steps / max(self._ep_steps, 1)),
-            # run14 ESC telemetry: fraction of steps the slip-angle gate cut throttle,
-            # plus the episode's max/mean slip angle (deg) -- so we can confirm ESC
-            # fires on slides (beta high) and not on clean driving (beta < BETA_DEAD).
-            "esc_cut_frac": float(self._esc_cut_steps / max(self._ep_steps, 1)),
+            # run16 learn-to-corner telemetry: slip-angle (does it slide?), the mean
+            # over-speed vs the target profile (does it brake?), and v_target at episode
+            # end. The watch: over_speed_mean -> ~0 (braking emerged) and beta low.
             "beta_max": float(self._max_beta),
             "beta_mean": float(self._beta_sum / max(self._ep_steps, 1)),
-            # run15 speed-scaled-rate telemetry: fraction of steps the SPEED-TIGHTENED
-            # rate (below base steer_rate) actively bound -- nonzero only at speed on a
-            # fast reversal, ~0 at corner speeds / sustained cornering.
-            "steer_ratehi_frac": float(self._steer_ratehi_steps / max(self._ep_steps, 1)),
+            "over_speed_mean": float(self._over_speed_sum / max(self._ep_steps, 1)),
+            "v_target_here": float(V_TARGET_PROFILE[self._progress_idx]),
         }
         return obs, reward + term_bonus, terminated, truncated, info
 
@@ -822,6 +767,15 @@ class BeamNGRaceEnv(gymnasium.Env):
         for p in look_pts:
             vals.append(_dist(pos, p) / MAX_LOOKAHEAD_DIST_M)
             vals.append(_bearing_to(forward, pos, p) / math.pi)
+        # run16 additions (the learn-to-corner signals):
+        # [15] signed curvature preview at the speed-scaled lookahead — how sharp / which way.
+        prev_arc = (anchor + l_d) % self._track_length
+        j = max(0, min(bisect.bisect_right(self._cum_arc, prev_arc) - 1, len(_PROFILE_KAPPA) - 1))
+        vals.append(float(np.clip(_PROFILE_KAPPA[j] / CURV_PREVIEW_KAPPA_SCALE, -1.0, 1.0)))
+        # [16] braking-aware target speed at the car — the number the reward rewards matching.
+        vals.append(float(np.clip(V_TARGET_PROFILE[idx] / PROFILE_V_MAX, -1.0, 1.0)))
+        # [17] slip-angle beta (last step, one-step lag) — "are you sliding".
+        vals.append(float(np.clip(self._last_beta / 45.0, -1.0, 1.0)))
         obs = np.array(vals, dtype=np.float32)
         return np.clip(obs, -1.0, 1.0)
 
@@ -846,7 +800,6 @@ class BeamNGRaceEnv(gymnasium.Env):
         s = _shared["vehicle"].sensors["agent_state"]
         vel = s["vel"]
         speed_horizontal = math.sqrt(vel[0] ** 2 + vel[1] ** 2)
-        self._last_speed_h = speed_horizontal   # run15: last-step speed for the authority cap
 
         # Track tangent at the car's current centerline index, used by BOTH the
         # velocity alignment and the run5 heading gate.
@@ -933,49 +886,39 @@ class BeamNGRaceEnv(gymnasium.Env):
 
         # Gate: clamp negative to zero so backward driving earns no reward.
         gated_alignment = max(0.0, raw_alignment)
-        final_reward = raw_progress * gated_alignment
+        # run16: progress is the cover-the-track core (kept). The speed-EVERYWHERE term,
+        # the steering/throttle smoothness penalties, and the wheelspin spin_penalty are
+        # all DROPPED -- braking/cornering are LEARNED via the two terms below.
+        final_reward = W_PROG * raw_progress * gated_alignment
 
-        # Anti-crawl speed reward: pay for carrying speed, but only on-line and
-        # pointed forward (gated_alignment is 0..1), so it never rewards fast
-        # off-track or reverse driving. Small by design (see SPEED_WEIGHT).
-        speed_reward = SPEED_WEIGHT * speed_horizontal * gated_alignment
+        # THE BRAKE SIGNAL: penalize exceeding the braking-aware target speed at the car's
+        # position (squared: gentle near target, sharp when hot). OVER_SPEED_OFFSET shifts
+        # the knee below v_target so the gradient is nonzero AT target (calibration knob).
+        v_target = float(V_TARGET_PROFILE[self._progress_idx])
+        over = max(0.0, speed_horizontal - (v_target - OVER_SPEED_OFFSET))
+        over_speed_penalty = -W_OVER * over * over
+        self._over_speed_sum += over
 
-        # Anti-wobble penalty: penalize the CHANGE in steering vs last tick, so
-        # smooth sustained turns are free and only bang-bang flip-flopping costs.
-        smoothness_penalty = -SMOOTH_WEIGHT * abs(self._cur_steer
-                                                  - self._prev_steer)
-        self._prev_steer = self._cur_steer
+        # Slip-angle penalty (replaces ESC + the wheelspin spin_penalty): a reward signal
+        # to not slide, so the policy LEARNS grip instead of having throttle cut. beta deg.
+        slip_penalty = -W_SLIP * max(0.0, self._last_beta - BETA_SLIP_DEAD)
 
-        # Anti-chatter penalty (run6): same form on the throttle/brake axis
-        # (action[1]). Penalizes the CHANGE, so a smooth ramp or one deliberate
-        # gas->brake transition is cheap but high-frequency gas<->brake flutter
-        # accumulates. Covers throttle chatter, brake chatter, and zero-crossing.
-        throttle_smooth_penalty = -THROTTLE_SMOOTH_WEIGHT * abs(
-            self._cur_throttle - self._prev_throttle)
-        self._prev_throttle = self._cur_throttle
-
-        # Anti-wheelspin penalty (run4): wheelspeed is the wheel-rotation speed
-        # (already polled via the Electrics sensor, just unused until now); when
-        # the rear tyres spin it reads far above the true ground speed. Penalize
-        # only the excess slip beyond the deadzone (see SLIP_DEADZONE/SPIN_WEIGHT).
+        # wheelspin 'slip' kept for max_slip telemetry only (no longer penalized; TC gone)
         wheelspeed = float(_shared["vehicle"].sensors["electrics"].get(
             "wheelspeed", speed_horizontal))
         slip = wheelspeed - speed_horizontal
         self._max_slip = max(self._max_slip, slip)
-        spin_penalty = -SPIN_WEIGHT * max(0.0, slip - SLIP_DEADZONE)
-
-        # (run10) The weave is fixed structurally via the speed-scaled steering
-        # reference in _get_observation, not by a reward penalty -- runs 6-9 proved
-        # reward shaping cannot remove a control instability. No weave term here.
+        self._prev_steer = self._cur_steer
+        self._prev_throttle = self._cur_throttle
 
         self._last_raw_progress = raw_progress
         self._last_raw_alignment = raw_alignment
         self._last_final_reward = final_reward
-        self._last_speed_reward = speed_reward
-        self._last_smoothness_penalty = smoothness_penalty
-        self._last_throttle_smooth_penalty = throttle_smooth_penalty
+        self._last_speed_reward = over_speed_penalty       # diag slot now = over-speed penalty
+        self._last_smoothness_penalty = 0.0
+        self._last_throttle_smooth_penalty = 0.0
         self._last_slip = slip
-        self._last_spin_penalty = spin_penalty
+        self._last_spin_penalty = slip_penalty             # diag slot now = slip-angle penalty
 
         if final_reward > 0.01:
             self._steps_since_progress = 0
@@ -993,12 +936,9 @@ class BeamNGRaceEnv(gymnasium.Env):
                 self._checkpoints_hit.add(k)
                 self._checkpoints_reached += 1
                 checkpoint_bonus += CHECKPOINT_BONUS
-        # Existing progress/checkpoint terms stay dominant; the speed/smoothness
-        # nudges, wheelspin penalty, throttle-smoothness, and run8 weave penalty
-        # layer on top.
-        return float(final_reward + checkpoint_bonus + speed_reward
-                     + smoothness_penalty + throttle_smooth_penalty
-                     + spin_penalty)
+        # run16 total: progress + checkpoints − over-speed − slip-angle. The over-speed
+        # term is the brake signal; progress rewards covering ground at/below v_target.
+        return float(final_reward + checkpoint_bonus + over_speed_penalty + slip_penalty)
 
     def _check_done(self) -> Tuple[bool, float]:
         """Did the episode end? If so, what bonus or penalty applies?
@@ -1141,11 +1081,9 @@ def _yaw_to_quat(yaw: float):
 def make_beamng_env(random_spawn: bool, home: Optional[str] = None,
                     host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                     launch: bool = False, headless: bool = False,
-                    nogpu: bool = False, steer_rate: float = 0.0,
-                    esc_min: float = 1.0, steer_rate_hi: float = -1.0):
+                    nogpu: bool = False, steer_rate: float = 0.0):
     """Return a fresh BeamNGRaceEnv. No rtgym wrapping in v1."""
     return BeamNGRaceEnv(
         random_spawn=random_spawn, home=home, host=host, port=port,
         launch=launch, headless=headless, nogpu=nogpu, steer_rate=steer_rate,
-        esc_min=esc_min, steer_rate_hi=steer_rate_hi,
     )
