@@ -51,7 +51,10 @@ LOOKAHEAD_DISTANCES_M = [10.0, 20.0, 40.0, 80.0, 160.0, 280.0]
 # /300 spans ~0..0.93 and never clips).
 MAX_LOOKAHEAD_DIST_M = 300.0
 CENTER_OFFSET_CLIP_M = 10.0
-OFF_TRACK_THRESHOLD_M = 20.0        # generous; tighten once centerline is real
+OFF_TRACK_THRESHOLD_M = 8.0         # run17: ~max road half-width (saved avg full width
+                                    # 11.41m -> ~5.7m half) + margin, so the episode ends
+                                    # the instant the car leaves the road (was 20m, which
+                                    # let a cut corner wander deep into grass before ending)
 STUCK_STEPS_THRESHOLD = 200
 STOPPED_SPEED_M_S = 0.5             # below this, treat the car as stationary
                                     # for alignment purposes (no backward penalty)
@@ -486,8 +489,10 @@ class BeamNGRaceEnv(gymnasium.Env):
             idx = int(self.np_random.integers(0, len(CENTERLINE)))
             heading_offset = math.radians(float(self.np_random.uniform(
                 -RANDOM_HEADING_DEG, RANDOM_HEADING_DEG)))
-            start_speed = float(self.np_random.uniform(
-                0, RANDOM_SPEED_MAX_M_S))
+            # run17: cap the random start speed at the spawn point's braking-aware
+            # target (never spawn ABOVE the corner's grip-limited speed -> not
+            # pre-crashed). 0 .. v_target[idx].
+            start_speed = float(self.np_random.uniform(0.0, V_TARGET_PROFILE[idx]))
         else:
             idx = 0
             heading_offset = 0.0
@@ -545,6 +550,12 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._last_centerline_dist = self._cur_centerline_dist
         self._steps_since_progress = 0
         self._checkpoints_hit = set()
+        # run17: on a mid-track spawn, mark checkpoints already BEHIND the spawn arc as
+        # hit so they don't all instant-award on step 0 (d>=thresh for everything passed).
+        # Only checkpoints AHEAD of the spawn earn as the car actually drives forward.
+        for _k, _thresh in enumerate(self._checkpoint_distances):
+            if _thresh <= self._cur_centerline_dist:
+                self._checkpoints_hit.add(_k)
         self._checkpoints_reached = 0
         # No prior action at spawn, so the first step has zero steering/throttle
         # change.

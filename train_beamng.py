@@ -131,6 +131,9 @@ def parse_args():
                    help="run13/16 steering slew-rate limit: flat symmetric cap on "
                         "|Δsteer|/step (action[0]). 0.0 = OFF; run16 uses 0.5 (the one "
                         "retained scripted constraint).")
+    p.add_argument("--random-spawn", action="store_true",
+                   help="run17 spawn curriculum: distribute TRAIN episode starts around "
+                        "the whole track (eval env always starts at the line). Off by default.")
     return p.parse_args()
 
 
@@ -184,10 +187,10 @@ def main():
                          "over_speed_mean", "v_target_here")
     train_env = Monitor(
         make_beamng_env(
-            # Curriculum: fixed start at the start/finish line (idx=0) every
-            # episode, so the car learns the track as a sequence and gets
-            # further each time. (random_spawn=False -> idx=0, heading 0, rest.)
-            random_spawn=False, home=args.home, host=args.host, port=args.port,
+            # run17 spawn curriculum: random_spawn distributes episode starts around the
+            # whole track (random idx + per-idx heading + start-speed capped at v_target),
+            # so every corner's line gets practiced instead of only T1-from-the-start-line.
+            random_spawn=args.random_spawn, home=args.home, host=args.host, port=args.port,
             launch=args.launch, headless=args.headless, nogpu=args.nogpu,
             steer_rate=args.steer_rate,
         ),
