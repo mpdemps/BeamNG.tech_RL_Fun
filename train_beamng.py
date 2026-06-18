@@ -26,14 +26,59 @@ Troubleshooting:
 import argparse
 import datetime
 import os
+from collections import Counter
 from pathlib import Path
 
+import numpy as np
 from stable_baselines3 import SAC  # run16: plain SAC (Grad-CAPS dropped in the paradigm reset)
 from stable_baselines3.common.callbacks import (
     BaseCallback, CheckpointCallback, EvalCallback)
 from stable_baselines3.common.monitor import Monitor
 
 from envs.beamng_env import make_beamng_env, _shared
+
+
+class TBEvalCallback(EvalCallback):
+    """EvalCallback + trustworthy TB scalars from the EVAL (start-line, deterministic)
+    episodes, so the clean reads sit next to eval/mean_reward and we stop doing manual
+    start-line replays. Behavior-neutral: only reads the env info dict at episode end.
+
+    Logs (over the n_eval_episodes): eval/mean_speed, eval/max_arc(+_best),
+    eval/over_speed_frac, eval/beta_mean, eval/beta_p90, eval/checkpoints_mean(+_max),
+    the reward-term decomposition (eval/r_progress|r_match|r_overspeed|r_slip), and the
+    termination-reason fractions (eval/term_<reason>)."""
+    _TERMS = ("off_track", "flip", "stuck", "backward", "lap", "run")
+    _MEAN_KEYS = ("mean_speed", "max_arc", "over_speed_frac", "beta_mean", "beta_p90",
+                  "checkpoints_reached", "r_progress", "r_match", "r_overspeed", "r_slip")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._eval_infos = []
+
+    def _log_success_callback(self, locals_, globals_):
+        super()._log_success_callback(locals_, globals_)
+        if locals_.get("done"):
+            info = locals_["info"]
+            self._eval_infos.append({k: info.get(k) for k in
+                                     self._MEAN_KEYS + ("termination_reason",)})
+
+    def _on_step(self):
+        result = super()._on_step()
+        if self._eval_infos:                      # an eval just completed this step
+            infos, n = self._eval_infos, len(self._eval_infos)
+            for k in self._MEAN_KEYS:
+                vals = [i[k] for i in infos if i[k] is not None]
+                if vals:
+                    self.logger.record(f"eval/{k}", float(np.mean(vals)))
+            self.logger.record("eval/max_arc_best", float(max(i["max_arc"] for i in infos)))
+            self.logger.record("eval/checkpoints_max",
+                               float(max(i["checkpoints_reached"] for i in infos)))
+            cnt = Counter(i["termination_reason"] for i in infos)
+            for reason in self._TERMS:
+                self.logger.record(f"eval/term_{reason}", cnt.get(reason, 0) / n)
+            self.logger.dump(self.num_timesteps)  # write at the eval step
+            self._eval_infos = []
+        return result
 
 
 class MilestoneSnapshotCallback(BaseCallback):
@@ -255,7 +300,7 @@ def main():
             **hyperparams,
         )
 
-    eval_callback = EvalCallback(
+    eval_callback = TBEvalCallback(
         eval_env,
         best_model_save_path=str(best_dir),
         log_path=str(log_dir / "eval"),

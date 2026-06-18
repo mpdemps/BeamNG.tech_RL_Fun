@@ -429,6 +429,11 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._last_beta = 0.0        # run14/16: last-step slip angle (deg); feeds obs + slip penalty
         self._max_beta = 0.0         # telemetry: episode max slip angle
         self._beta_sum = 0.0         # telemetry: for episode-mean slip angle
+        self._beta_list = []         # logging-only: per-step beta for episode p90
+        self._progress_sum = 0.0     # logging-only: per-episode reward-term sums
+        self._match_sum = 0.0
+        self._over_pen_sum = 0.0
+        self._slip_pen_sum = 0.0
         self._over_speed_sum = 0.0   # run16 telemetry: sum of max(0, v - v_target) per step
         self._over_speed_steps = 0   # run18 telemetry: count of steps over v_target
         self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
@@ -584,6 +589,11 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._last_beta = 0.0        # run14/16: last-step slip angle (deg); feeds obs + slip penalty
         self._max_beta = 0.0         # telemetry: episode max slip angle
         self._beta_sum = 0.0         # telemetry: for episode-mean slip angle
+        self._beta_list = []         # logging-only: per-step beta for episode p90
+        self._progress_sum = 0.0     # logging-only: per-episode reward-term sums
+        self._match_sum = 0.0
+        self._over_pen_sum = 0.0
+        self._slip_pen_sum = 0.0
         self._over_speed_sum = 0.0   # run16 telemetry: sum of max(0, v - v_target) per step
         self._over_speed_steps = 0   # run18 telemetry: count of steps over v_target
         self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
@@ -668,6 +678,12 @@ class BeamNGRaceEnv(gymnasium.Env):
             # end. The watch: over_speed_mean -> ~0 (braking emerged) and beta low.
             "beta_max": float(self._max_beta),
             "beta_mean": float(self._beta_sum / max(self._ep_steps, 1)),
+            "beta_p90": float(np.percentile(self._beta_list, 90)) if self._beta_list else 0.0,
+            # logging-only reward-term decomposition (per-episode sums):
+            "r_progress": float(self._progress_sum),
+            "r_match": float(self._match_sum),
+            "r_overspeed": float(self._over_pen_sum),
+            "r_slip": float(self._slip_pen_sum),
             "over_speed_mean": float(self._over_speed_sum / max(self._ep_steps, 1)),
             "over_speed_frac": float(self._over_speed_steps / max(self._ep_steps, 1)),
             "v_target_here": float(V_TARGET_PROFILE[self._progress_idx]),
@@ -855,6 +871,7 @@ class BeamNGRaceEnv(gymnasium.Env):
             self._last_beta = math.degrees(math.acos(max(-1.0, min(1.0, cos_b))))
         self._max_beta = max(self._max_beta, self._last_beta)
         self._beta_sum += self._last_beta
+        self._beta_list.append(self._last_beta)   # logging-only: for per-episode beta p90
         if heading_align < HEADING_KILL_THRESHOLD:
             self._backward_steps += 1
         else:
@@ -928,6 +945,13 @@ class BeamNGRaceEnv(gymnasium.Env):
         # Slip-angle penalty (replaces ESC + the wheelspin spin_penalty): a reward signal
         # to not slide, so the policy LEARNS grip instead of having throttle cut. beta deg.
         slip_penalty = -W_SLIP * max(0.0, self._last_beta - BETA_SLIP_DEAD)
+
+        # logging-only: per-episode sums of each reward term so TB can show real progress
+        # apart from the match term ("paid to crawl"). Behavior-neutral.
+        self._progress_sum += final_reward
+        self._match_sum += match_reward
+        self._over_pen_sum += over_speed_penalty
+        self._slip_pen_sum += slip_penalty
 
         # wheelspin 'slip' kept for max_slip telemetry only (no longer penalized; TC gone)
         wheelspeed = float(_shared["vehicle"].sensors["electrics"].get(
