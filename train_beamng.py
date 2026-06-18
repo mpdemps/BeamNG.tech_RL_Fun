@@ -184,7 +184,7 @@ def main():
                          "mean_speed", "max_arc", "min_heading_align",
                          "max_slip", "steer_clip_frac",
                          "beta_max", "beta_mean",
-                         "over_speed_mean", "v_target_here")
+                         "over_speed_mean", "over_speed_frac", "v_target_here")
     train_env = Monitor(
         make_beamng_env(
             # run17 spawn curriculum: random_spawn distributes episode starts around the

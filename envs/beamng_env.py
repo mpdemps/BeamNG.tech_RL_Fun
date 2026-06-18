@@ -273,6 +273,11 @@ V_TARGET_PROFILE, _PROFILE_R, _PROFILE_ARC, _PROFILE_TRACKLEN, _PROFILE_KAPPA = 
 W_PROG = 1.0           # progress * alignment (cover the track, forward only)
 W_OVER = 0.05          # over-speed penalty: -W_OVER * max(0, v - (v_target - offset))^2
 W_SLIP = 0.05          # slip-angle penalty: -W_SLIP * max(0, |beta_deg| - BETA_SLIP_DEAD)
+W_MATCH = 0.10         # run18 anti-timid nudge: +W_MATCH * min(v, v_target) * alignment.
+                       # CAPPED at v_target (flat above -> adds NO incentive past target,
+                       # so v* stays ~v_target) and alignment-gated (no reward for off-line
+                       # speed). Rewards carrying speed UP TO target -> breaks the timid
+                       # crawl the progress term alone couldn't (run17 crawled at 2.4 m/s).
 OVER_SPEED_OFFSET = 0.0  # m/s; start the over-speed penalty this far BELOW v_target so the
                          # gradient is nonzero AT target (fixes the zero-gradient margin).
                          # 0 = off; raise in the smoke if reward-optimal speed runs hot.
@@ -425,6 +430,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._max_beta = 0.0         # telemetry: episode max slip angle
         self._beta_sum = 0.0         # telemetry: for episode-mean slip angle
         self._over_speed_sum = 0.0   # run16 telemetry: sum of max(0, v - v_target) per step
+        self._over_speed_steps = 0   # run18 telemetry: count of steps over v_target
         self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
         self._thr_stream = []
         self._rl_prev_steer = 0.0    # run13: last APPLIED steer (rate-limit ramps from here)
@@ -579,6 +585,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._max_beta = 0.0         # telemetry: episode max slip angle
         self._beta_sum = 0.0         # telemetry: for episode-mean slip angle
         self._over_speed_sum = 0.0   # run16 telemetry: sum of max(0, v - v_target) per step
+        self._over_speed_steps = 0   # run18 telemetry: count of steps over v_target
         self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
         self._thr_stream = []
         self._rl_prev_steer = 0.0    # run13: last APPLIED steer (rate-limit ramps from here)
@@ -662,6 +669,7 @@ class BeamNGRaceEnv(gymnasium.Env):
             "beta_max": float(self._max_beta),
             "beta_mean": float(self._beta_sum / max(self._ep_steps, 1)),
             "over_speed_mean": float(self._over_speed_sum / max(self._ep_steps, 1)),
+            "over_speed_frac": float(self._over_speed_steps / max(self._ep_steps, 1)),
             "v_target_here": float(V_TARGET_PROFILE[self._progress_idx]),
         }
         return obs, reward + term_bonus, terminated, truncated, info
@@ -909,6 +917,13 @@ class BeamNGRaceEnv(gymnasium.Env):
         over = max(0.0, speed_horizontal - (v_target - OVER_SPEED_OFFSET))
         over_speed_penalty = -W_OVER * over * over
         self._over_speed_sum += over
+        if over > 0.01:
+            self._over_speed_steps += 1
+
+        # run18 anti-timid nudge: reward carrying speed UP TO the target (capped at
+        # v_target so it adds no incentive to exceed it; alignment-gated so off-line
+        # speed earns nothing). This is what breaks the timid crawl.
+        match_reward = W_MATCH * min(speed_horizontal, v_target) * gated_alignment
 
         # Slip-angle penalty (replaces ESC + the wheelspin spin_penalty): a reward signal
         # to not slide, so the policy LEARNS grip instead of having throttle cut. beta deg.
@@ -949,7 +964,8 @@ class BeamNGRaceEnv(gymnasium.Env):
                 checkpoint_bonus += CHECKPOINT_BONUS
         # run16 total: progress + checkpoints − over-speed − slip-angle. The over-speed
         # term is the brake signal; progress rewards covering ground at/below v_target.
-        return float(final_reward + checkpoint_bonus + over_speed_penalty + slip_penalty)
+        return float(final_reward + checkpoint_bonus + over_speed_penalty + slip_penalty
+                     + match_reward)
 
     def _check_done(self) -> Tuple[bool, float]:
         """Did the episode end? If so, what bonus or penalty applies?
