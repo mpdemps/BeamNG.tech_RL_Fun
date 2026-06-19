@@ -109,12 +109,16 @@ def crashed(run):
         return False
 
 
-def launch(run, timesteps, lr, warm, steer_rate, random_spawn):
-    """Launch a training segment as a child process, tee to console log."""
+def launch(run, timesteps, lr, warm, steer_rate, random_spawn, blend=None, beta_offset=0):
+    """Launch a training segment as a child process, tee to console log. `blend`, if given, is
+    (beta_warmup, beta_anneal_end); beta_offset = global steps already done (fade is global)."""
     os.makedirs("logs", exist_ok=True)
     cmd = [sys.executable, "train_beamng.py", "--run-name", run,
            "--timesteps", str(timesteps), "--nogpu", "--learning-rate", str(lr),
            "--steer-rate", str(steer_rate)] + (["--random-spawn"] if random_spawn else [])
+    if blend is not None:
+        cmd += ["--blend-fade", "--beta-warmup", str(blend[0]),
+                "--beta-anneal-end", str(blend[1]), "--beta-offset", str(beta_offset)]
     if warm:
         # WARM_LEARNING_STARTS > batch_size (256): on a self-heal the replay buffer
         # starts EMPTY (not saved), so learning_starts=0 made SAC's first train()
@@ -144,8 +148,15 @@ def main():
     ap.add_argument("--warm", default=None)
     ap.add_argument("--steer-rate", type=float, default=0.0)
     ap.add_argument("--random-spawn", action="store_true")
+    ap.add_argument("--blend-fade", action="store_true",
+                    help="run21 guided residual RL: fade the base controller out. Threads "
+                         "--blend-fade + the beta schedule, and --beta-offset=done so the fade "
+                         "tracks GLOBAL progress across warm-restarts.")
+    ap.add_argument("--beta-warmup", type=int, default=100_000)
+    ap.add_argument("--beta-anneal-end", type=int, default=400_000)
     args = ap.parse_args()
 
+    blend = (args.beta_warmup, args.beta_anneal_end) if args.blend_fade else None
     done = 0
     warm = args.warm
     seg = 0
@@ -154,7 +165,8 @@ def main():
         remaining = args.total - done
         print(f"[supervisor] segment {seg}: run={run} remaining={remaining} "
               f"warm={warm or 'FRESH'}", flush=True)
-        p, log = launch(run, remaining, args.lr, warm, args.steer_rate, args.random_spawn)
+        p, log = launch(run, remaining, args.lr, warm, args.steer_rate, args.random_spawn,
+                        blend=blend, beta_offset=done)
 
         outcome = None
         while True:

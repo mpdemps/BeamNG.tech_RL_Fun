@@ -36,6 +36,8 @@ from stable_baselines3.common.callbacks import (
 from stable_baselines3.common.monitor import Monitor
 
 from envs.beamng_env import make_beamng_env, _shared
+from envs.base_controller import BaseController
+from envs.blend_sac import BlendSAC
 
 
 class TBEvalCallback(EvalCallback):
@@ -179,6 +181,20 @@ def parse_args():
     p.add_argument("--random-spawn", action="store_true",
                    help="run17 spawn curriculum: distribute TRAIN episode starts around "
                         "the whole track (eval env always starts at the line). Off by default.")
+    p.add_argument("--blend-fade", action="store_true",
+                   help="run21 guided residual RL: blend the base controller into the applied "
+                        "action during data collection (beta*controller + (1-beta)*policy), "
+                        "fading beta 1->0. Eval is always beta=0 (standalone policy). Off by default.")
+    p.add_argument("--beta-warmup", type=int, default=100_000,
+                   help="run21: hold beta=1 (pure controller) for this many steps, filling the "
+                        "buffer with clean controller laps before the anneal.")
+    p.add_argument("--beta-anneal-end", type=int, default=400_000,
+                   help="run21: beta reaches 0 at this step (linear anneal from --beta-warmup); "
+                        "beta=0 held from here to the end (policy stands alone).")
+    p.add_argument("--beta-offset", type=int, default=0,
+                   help="run21: global steps already completed before this segment. The wrapper "
+                        "passes this on a warm-restart so beta tracks GLOBAL progress (num_timesteps "
+                        "resets to 0 each segment). 0 for a fresh first segment.")
     return p.parse_args()
 
 
@@ -267,6 +283,10 @@ def main():
         gradient_steps=1,
         ent_coef="auto",
     )
+    # run21: BlendSAC (controller fade-out) when --blend-fade, else plain SAC. BlendSAC is a
+    # drop-in SAC subclass; with the controller/schedule unset it behaves as plain SAC, so
+    # load/construct are identical and only the post-construction attribute set differs.
+    ModelCls = BlendSAC if args.blend_fade else SAC
     if args.warm_start:
         # run4 warm-start: load a prior SAC policy and continue training it,
         # rather than fresh init. custom_objects overrides BOTH learning_rate and
@@ -277,9 +297,9 @@ def main():
         # usual random-action warmup -- the proof the warm-start took.
         if not os.path.isfile(args.warm_start):
             raise SystemExit(f"--warm-start file not found: {args.warm_start}")
-        print(f"WARM-START: SAC.load({args.warm_start})  "
+        print(f"WARM-START: {ModelCls.__name__}.load({args.warm_start})  "
               f"lr={args.learning_rate}  learning_starts={args.learning_starts}", flush=True)
-        model = SAC.load(
+        model = ModelCls.load(
             args.warm_start,
             env=train_env,
             device="cpu",
@@ -291,7 +311,7 @@ def main():
             tensorboard_log=str(log_dir),
         )
     else:
-        model = SAC(
+        model = ModelCls(
             "MlpPolicy",
             train_env,
             verbose=1,
@@ -299,6 +319,17 @@ def main():
             device="cpu",
             **hyperparams,
         )
+
+    if args.blend_fade:
+        # run21: attach the base controller + fade schedule. Set AFTER construction so
+        # load()/SAC.__init__ are untouched. Eval (policy.predict) never blends -> beta=0.
+        model.controller = BaseController()
+        model.beta_warmup = args.beta_warmup
+        model.beta_anneal_end = args.beta_anneal_end
+        model.beta_offset = args.beta_offset
+        print(f"BLEND-FADE: base controller ON; beta=1 -> 0 over "
+              f"[{args.beta_warmup:,}, {args.beta_anneal_end:,}] global steps, beta=0 after; "
+              f"offset={args.beta_offset:,}; eval always beta=0 (standalone policy).", flush=True)
 
     eval_callback = TBEvalCallback(
         eval_env,

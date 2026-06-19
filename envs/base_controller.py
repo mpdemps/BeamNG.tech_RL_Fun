@@ -27,9 +27,9 @@ def _wrap(a):
 
 
 class BaseController:
-    def __init__(self, line=RACELINE, k_v=0.6, l_min=6.0, l_max=25.0,
-                 k_steer=22.0, kp_speed=0.25, ki_speed=0.0, steer_sign=-1.0,
-                 speed_factor=1.0):
+    def __init__(self, line=RACELINE, k_v=0.7, l_min=6.0, l_max=22.0,
+                 k_steer=7.0, kp_speed=0.35, ki_speed=0.0, steer_sign=-1.0,
+                 speed_factor=0.95):
         self.P = np.asarray(line, float)[:, :2]
         self.n = len(self.P)
         seg = np.linalg.norm(np.roll(self.P, -1, axis=0) - self.P, axis=1)
