@@ -272,7 +272,12 @@ V_TARGET_PROFILE, _PROFILE_R, _PROFILE_ARC, _PROFILE_TRACKLEN, _PROFILE_KAPPA = 
 # run16 reward weights (calibrated in the smoke per the W_OVER/W_PROG gate).
 W_PROG = 1.0           # progress * alignment (cover the track, forward only)
 W_OVER = 0.05          # over-speed penalty: -W_OVER * max(0, v - (v_target - offset))^2
-W_SLIP = 0.05          # slip-angle penalty: -W_SLIP * max(0, |beta_deg| - BETA_SLIP_DEAD)
+W_SLIP = 0.15          # run19: 0.05->0.15 (3x). slip-angle penalty: -W_SLIP * max(0, |beta_deg| -
+                       # BETA_SLIP_DEAD). run18 T1 trace: in the recoverable zone (beta 9-20deg) the
+                       # old -0.08..-0.5/step was dwarfed by the throttle's ~+4/step (progress+match),
+                       # so flooring at turn-in won 10x. 0.15 makes a building slide (beta 8->15) cost
+                       # -0.15..-1.35, rivaling the match term so feathering beats flooring BEFORE the
+                       # spin commits. Ladder: still spins -> 5-6x before the racing line; timid -> lower.
 W_MATCH = 0.10         # run18 anti-timid nudge: +W_MATCH * min(v, v_target) * alignment.
                        # CAPPED at v_target (flat above -> adds NO incentive past target,
                        # so v* stays ~v_target) and alignment-gated (no reward for off-line
@@ -281,7 +286,11 @@ W_MATCH = 0.10         # run18 anti-timid nudge: +W_MATCH * min(v, v_target) * a
 OVER_SPEED_OFFSET = 0.0  # m/s; start the over-speed penalty this far BELOW v_target so the
                          # gradient is nonzero AT target (fixes the zero-gradient margin).
                          # 0 = off; raise in the smoke if reward-optimal speed runs hot.
-BETA_SLIP_DEAD = 9.0   # deg; clean tracking p90 ~5deg, slides 17-46deg
+BETA_SLIP_DEAD = 7.0   # run19: 9->7 deg. run18 T1 trace: the rear breaks loose at beta 5-8deg
+                       # (throttle high, steering loaded) but the old 9deg deadband read EXACTLY 0
+                       # through that recoverable window -- the penalty only engaged after the slide
+                       # was committed. 7deg catches it at onset; clean tracking p90 ~5deg + clean-
+                       # steering transients ~6-7deg stay ~free, so only the building slide pays.
 CURV_PREVIEW_KAPPA_SCALE = 0.04  # 1/m; obs curvature-preview normalization (R~25m -> ~1.0)
 
 
