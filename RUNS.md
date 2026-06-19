@@ -810,3 +810,176 @@ real spin, then fix that gate. See `docs\mikey_run8_postwatch_weave_diagnostic.m
 - Clean checkpoint used for the watch: `checkpoints\mikey_run8_resume\rolling_115000_steps.zip`
 - Warm-restart load source: `checkpoints\mikey_run8\rolling_65000_steps.zip`
 - Diagnostic brief: `docs\mikey_run8_postwatch_weave_diagnostic.md`
+
+---
+
+> **Journal gap, runs 9-17.** These were tracked in `docs\mikey_run*_plan_*.md`
+> rather than here. In brief: the constraint-stack saga, runs 10-15 bolted
+> hand-tuned action constraints onto the policy to stop a T1 spin (run11 traction
+> cap, run12 Grad-CAPS action-smoothness, run13 steering-rate limit, run14 ESC
+> slip-angle throttle cut, run15 authority cap). Deep research
+> (`docs\research_learn_to_corner_2026-06-15.md`) concluded the constraint-stacking
+> was the anti-pattern and braking/cornering must be LEARNED via reward +
+> observation + curriculum. run16 reset to a braking-aware speed-target reward
+> (`envs\speed_profile.py`, the v_target profile) + an 18-dim obs with a
+> speed-scaled curvature preview + slip-angle, retiring the constraint stack
+> (kept ONE steering-rate limit). run17 added the spawn curriculum (random starts
+> around the track) + a clean 8m off-track termination. run17's verdict: the
+> timid local optimum, it crawled to ~100m at ~2.4 m/s from the start line and
+> never reached T1.
+
+---
+
+## run18_anti_timid_nudge (SAC, fresh, 500k)
+
+### Date
+
+2026-06-16 launch to 2026-06-18 complete; G14 watch 2026-06-19
+
+### Hyperparameters
+
+- Algorithm: SAC (plain), fresh launch, full 500k (restarted once at step 0 to
+  add the eval/* TensorBoard instrumentation, behavior-neutral logging only)
+- learning_rate: 1e-4, gamma: 0.99
+- `--steer-rate 0.5`, `--random-spawn` (run17 spawn curriculum kept)
+- Changes since last run (ONE behavioral change): the anti-timid nudge, a new
+  reward term `+ W_MATCH * min(v, v_target) * gated_alignment`, W_MATCH=0.10,
+  alignment-gated so it only pays for speed going forward on-line. The `min`
+  cap is load-bearing, flat above v_target, so it adds zero incentive to exceed
+  the grip-limited target (calibration confirmed reward peak stays at
+  v_target). Directly attacks run17's crawl local optimum: carrying speed now
+  pays, so "crawl" stops being reward-optimal. Plan:
+  `docs\mikey_run18_plan_anti_timid_nudge.md`.
+- Also added (instrumentation, not behavior): 20 eval/* TB cards, mean_speed,
+  max_arc, over_speed_frac, beta mean/p90, per-termination fractions, reward-term
+  decomposition (r_progress / r_match / r_overspeed / r_slip), checkpoints. So we
+  read the trustworthy metrics live instead of manual start-line replays.
+
+### Timesteps
+
+500,000 (complete)
+
+### Peak Eval Reward
+
+~680 (eval mean_reward, mid-run). NOTE: the reward is partly the match term
+paying for any forward speed, so it is NOT the trustworthy signal this run. The
+honest metrics: eval mean_speed plateaued ~20 m/s (from run17's 2.4 crawl),
+eval r_progress ~300 (real ground covered), term_stuck pinned at 0.
+
+### Final Eval Reward
+
+~615 (eval mean_reward). Decisive honest numbers: mean_speed ~20 m/s, but
+max_arc plateaued ~316 (best-ever 347) and checkpoints stuck at 1, the car
+reaches T1's apex (338m) but never the exit (394m). End-of-run eval showed
+beta_p90 spiking to ~53 and an over-speed blip, the throttle-oversteer signature
+(see watch).
+
+### Watching Notes
+
+G14 watch of best_model (3x deterministic, identical every time): (1) good
+controlled acceleration to ~90 kph; (2) slight left-right oscillation but in
+control; (3) approaching T1, BRAKES correctly, slows to ~40 kph; (4) at TURN-IN
+(entry, nowhere near the apex/exit), FLOORS the throttle and the rear steps out;
+(5) continued full throttle, SPINS and slides off the OUTSIDE (right side of the
+left corner) and off the track, before reaching the apex. VERDICT: the run18
+thesis is PROVEN, the timidity is broken, the car now drives at real pace AND
+brakes for the corner. The remaining failure is NOT braking and NOT the line, it
+is THROTTLE DISCIPLINE on corner ENTRY: at turn-in it mashes the gas on a 748hp
+RWD car, the rear breaks loose (power oversteer) and it spins off the outside
+before even getting through the corner. NOTE on the reward: at turn-in v_target
+is at the corner's low point, so flooring it trips BOTH the over-speed penalty
+AND the slip penalty, yet the policy does it anyway, so those penalty signals are
+too weak versus the throttle's progress reward (or the policy is simply
+unconverged at a corner it rarely gets through). The slip-angle penalty meant to
+teach throttle control is the most direct lever.
+
+### Mikey's Hypothesis for Next Run
+
+(Proposed, pending Mikey's approval.) The car drives great and even brakes for
+the turn, but the instant it starts turning into the corner it hits the gas too
+hard and the back wheels spin out, like flooring a powerful car on a wet road.
+Make spinning the tires cost more points so it learns to squeeze the gas gently
+as it turns in instead of flooring it: raise the tire-slip penalty (W_SLIP) and
+likely lower BETA_DEAD from 9 degrees so it notices the slide sooner. This is the reward teaching the skill
+(the GT Sophy tire-slip lesson), NOT re-adding scripted traction control. Likely
+WARM-start from run18's best_model, the policy already brakes and turns, it just
+needs to refine the throttle, not relearn driving.
+
+### Artifacts
+
+- TensorBoard log dir: `logs\mikey_run18`
+- Best model: `checkpoints\mikey_run18\best_model\best_model.zip`
+- Plan: `docs\mikey_run18_plan_anti_timid_nudge.md`
+
+---
+
+## run19_slip_penalty (SAC, warm from run18, STOPPED ~220k of 500k)
+
+### Date
+
+2026-06-19
+
+### Hyperparameters
+
+- Algorithm: SAC, warm-start from run18's best_model
+  (`--warm-start checkpoints/mikey_run18/best_model/best_model.zip`,
+  learning-starts 5000)
+- learning_rate: 1e-4, gamma: 0.99, `--steer-rate 0.5`, `--random-spawn`
+- Changes since last run (ONE term, two knobs): strengthen the slip-angle penalty
+  to teach throttle discipline at T1 turn-in. BETA_SLIP_DEAD 9.0 -> 7.0 (fire at
+  the slide onset, not after), W_SLIP 0.05 -> 0.15 (3x, so the slide outcosts the
+  throttle in the recoverable zone). Calibrated against a deterministic spin trace
+  of run18 (penalty was reading 0 through beta 5-8 deg and only -0.08 once on).
+  Everything else stays run18. Plan: `docs\mikey_run19_plan_slip_penalty.md`.
+
+### Timesteps
+
+STOPPED at ~220k of 500k. The mid-run G14 watch gave a decisive (negative)
+verdict; no reason to finish.
+
+### Peak Eval Reward
+
+~550 (eval mean_reward, mid-run). As always the reward is not the trustworthy
+signal. The honest cards at ~220k: mean_speed on a clean DOWNWARD trend
+(~20 -> ~13.6, the timidity guard breaching), max_arc stuck ~287 (best ~340,
+never the 394 exit), r_slip still deeply negative (~-100, not climbing toward 0),
+beta_p90 oscillating 10-45 (still sliding intermittently).
+
+### Final Eval Reward
+
+n/a (stopped). The state at stop: slower AND still spinning AND stuck at the T1
+wall, with the two signals pointing opposite ways (speed down = lower W_SLIP;
+still-spinning = raise W_SLIP), i.e. no good single weight.
+
+### Watching Notes
+
+Mid-run G14 watch of best_model @ ~220k (3x deterministic, identical): (1) floors
+it for a second at launch, then backs off and VERY SLOWLY accelerates ~30 -> ~100
+kph by T1 (the timidity, confirmed); (2) all three run wide to the RIGHT at T1
+entry and then FLOOR it; (3) no attempt to turn, one terminated off-track, two
+drove straight into the T1 wall on the right. VERDICT: the policy has stopped
+trying to corner. Root cause: at T1, "cornering hard at the limit" and "the rear
+starting to spin" produce the SAME slip-angle (beta), so the strengthened penalty
+taxed the aggressive cornering, not just the spin. The policy's safest response to
+"turning hard costs me" is to stop turning, going straight and flooring it
+generates almost no lateral slip, so it dodges the penalty and crashes instead.
+This is why the cards conflicted and why no W_SLIP value works: the slip penalty
+cannot distinguish good cornering slip from bad spin slip. It is the wrong lever
+for T1.
+
+### Mikey's Hypothesis for Next Run
+
+The "don't slide" rule backfired, the car learned that turning hard is what makes
+it slide, so it stopped turning and drives straight off the road. We cannot fix
+that by tuning the rule, because hard turning and spinning look the same to it. So
+give the car a RACING LINE (an explicit drawn path through the corner to follow)
+plus TRACK EDGES in its eyes (so it can see the wall coming instead of only being
+terminated by it). The line encodes "after you enter wide-right, turn left to the
+apex," the exact move it is not making; the edges give boundary awareness for the
+wall it keeps hitting. See `docs\mikey_run20_plan_racing_line.md`.
+
+### Artifacts
+
+- TensorBoard log dir: `logs\mikey_run19`
+- Best model: `checkpoints\mikey_run19\best_model\best_model.zip`
+- Plan: `docs\mikey_run19_plan_slip_penalty.md`
