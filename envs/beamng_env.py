@@ -259,25 +259,34 @@ DEFAULT_PORT = 25252
 # import is kept here, commented, as a fallback reference: switch back if
 # the built-in data ever proves wrong.
 # from data.centerline_racetrack import CENTERLINE  # original manual recording
-from data.centerline_racetrack_builtin import CENTERLINE
+from data.centerline_racetrack_builtin import CENTERLINE as ROAD_CENTERLINE
+from data.raceline_builtin import RACELINE
 from envs.speed_profile import compute_speed_profile, V_MAX as PROFILE_V_MAX
 
-# run16 paradigm reset: braking-aware target-speed profile, computed once over the
-# centerline (index-aligned with CENTERLINE / _cum_arc). The reward rewards matching it
-# (slow-in) and the obs exposes it; this is what makes BRAKING emerge instead of being
-# scripted. See docs/mikey_run16_plan_learn_to_corner.md + envs/speed_profile.py.
+# run20 RETARGET: the car now navigates by the offline min-curvature RACING LINE, not the road
+# center. Rebinding CENTERLINE -> RACELINE makes EVERY progress / lookahead / heading_err /
+# curvature-preview / v_target reference the line with no per-call changes -- they all index this
+# one array (and the index-aligned profile below). The obs SHAPE is unchanged (same 18 dims, just
+# computed relative to the line), which is what keeps warm-start from run18 clean. Off-track
+# TERMINATION still measures against ROAD_CENTERLINE (the actual road); the line sits <=4.2 m
+# off-center, well inside the 8 m road-edge threshold, so there is no termination conflict.
+# See docs/mikey_run7_design_racing_line.md (Option B) + envs/racing_line.py.
+CENTERLINE = RACELINE
+
+# run16 paradigm reset: braking-aware target-speed profile, computed once over the reference
+# path (index-aligned with CENTERLINE / _cum_arc) -- now the RACING LINE. The reward rewards
+# matching it (slow-in) and the obs exposes it; this is what makes BRAKING emerge instead of
+# being scripted. See docs/mikey_run16_plan_learn_to_corner.md + envs/speed_profile.py.
 V_TARGET_PROFILE, _PROFILE_R, _PROFILE_ARC, _PROFILE_TRACKLEN, _PROFILE_KAPPA = \
     compute_speed_profile(CENTERLINE)
 
 # run16 reward weights (calibrated in the smoke per the W_OVER/W_PROG gate).
 W_PROG = 1.0           # progress * alignment (cover the track, forward only)
 W_OVER = 0.05          # over-speed penalty: -W_OVER * max(0, v - (v_target - offset))^2
-W_SLIP = 0.15          # run19: 0.05->0.15 (3x). slip-angle penalty: -W_SLIP * max(0, |beta_deg| -
-                       # BETA_SLIP_DEAD). run18 T1 trace: in the recoverable zone (beta 9-20deg) the
-                       # old -0.08..-0.5/step was dwarfed by the throttle's ~+4/step (progress+match),
-                       # so flooring at turn-in won 10x. 0.15 makes a building slide (beta 8->15) cost
-                       # -0.15..-1.35, rivaling the match term so feathering beats flooring BEFORE the
-                       # spin commits. Ladder: still spins -> 5-6x before the racing line; timid -> lower.
+W_SLIP = 0.05          # slip-angle penalty: -W_SLIP * max(0, |beta_deg| - BETA_SLIP_DEAD). run20
+                       # REVERTED from run19's 0.15 back to run18's gentle 0.05: run19 (0.15/7.0)
+                       # taught corner-AVOIDANCE (it wouldn't take T1). The racing line now handles
+                       # where-to-go through the corner; slip is back to a light spin backstop only.
 W_MATCH = 0.10         # run18 anti-timid nudge: +W_MATCH * min(v, v_target) * alignment.
                        # CAPPED at v_target (flat above -> adds NO incentive past target,
                        # so v* stays ~v_target) and alignment-gated (no reward for off-line
@@ -286,11 +295,9 @@ W_MATCH = 0.10         # run18 anti-timid nudge: +W_MATCH * min(v, v_target) * a
 OVER_SPEED_OFFSET = 0.0  # m/s; start the over-speed penalty this far BELOW v_target so the
                          # gradient is nonzero AT target (fixes the zero-gradient margin).
                          # 0 = off; raise in the smoke if reward-optimal speed runs hot.
-BETA_SLIP_DEAD = 7.0   # run19: 9->7 deg. run18 T1 trace: the rear breaks loose at beta 5-8deg
-                       # (throttle high, steering loaded) but the old 9deg deadband read EXACTLY 0
-                       # through that recoverable window -- the penalty only engaged after the slide
-                       # was committed. 7deg catches it at onset; clean tracking p90 ~5deg + clean-
-                       # steering transients ~6-7deg stay ~free, so only the building slide pays.
+BETA_SLIP_DEAD = 9.0   # deg; run20 REVERTED from run19's 7.0 back to run18's 9.0 (clean tracking
+                       # p90 ~5deg, slides 17-46deg). run19's 7.0 + W_SLIP 0.15 made the car avoid
+                       # corners; the racing line now provides the line, slip is a light backstop.
 CURV_PREVIEW_KAPPA_SCALE = 0.04  # 1/m; obs curvature-preview normalization (R~25m -> ~1.0)
 
 
@@ -1076,19 +1083,18 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._cur_centerline_dist = (self._laps * self._track_length
                                      + self._cum_arc[self._progress_idx] + proj)
 
-    def _closest_checkpoint_idx(self, pos) -> int:
-        return int(np.argmin([_dist(pos, c) for c in CENTERLINE]))
-
     def _is_flipped(self) -> bool:
         """The car is on its roof (or close to it)."""
         up = _shared["vehicle"].sensors["agent_state"].get("up", (0.0, 0.0, 1.0))
         return up[2] < 0.5
 
     def _is_off_track(self) -> bool:
-        """The car wandered too far from the racing line."""
+        """The car left the ROAD. run20: distance is to the actual road centerline
+        (ROAD_CENTERLINE), NOT the racing line -- deviating from the line is allowed,
+        leaving the road is not. The on-road line sits <=4.2 m off-center, so following
+        it stays well inside the 8 m road-edge threshold."""
         pos = _shared["vehicle"].sensors["agent_state"]["pos"]
-        idx = self._closest_checkpoint_idx(pos)
-        return _dist(pos, CENTERLINE[idx]) > OFF_TRACK_THRESHOLD_M
+        return min(_dist(pos, c) for c in ROAD_CENTERLINE) > OFF_TRACK_THRESHOLD_M
 
 
 # ---- Small math helpers ----
