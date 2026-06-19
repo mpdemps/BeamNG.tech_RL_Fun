@@ -273,6 +273,25 @@ from envs.speed_profile import compute_speed_profile, V_MAX as PROFILE_V_MAX
 # See docs/mikey_run7_design_racing_line.md (Option B) + envs/racing_line.py.
 CENTERLINE = RACELINE
 
+# run21 off-track fix: ROAD_CENTERLINE vertices are sparse (gaps up to ~28 m), so measuring
+# off-track as distance to the nearest VERTEX spuriously inflates to >8 m where points are far
+# apart -- killing a car that is actually ON the road (the run20 controller died at arc ~1411/1856
+# this way, true perpendicular dist <1.3 m). Measure point-to-SEGMENT distance to the road
+# POLYLINE instead, which is correct regardless of vertex spacing. Precompute segment arrays once.
+_ROAD_A = np.asarray(ROAD_CENTERLINE, dtype=float)[:, :2]
+_ROAD_AB = np.roll(_ROAD_A, -1, axis=0) - _ROAD_A          # segment vectors A->B (closed loop)
+_ROAD_L2 = np.maximum(np.sum(_ROAD_AB ** 2, axis=1), 1e-9)
+
+
+def _dist_to_road(px, py):
+    """Min perpendicular distance from (px,py) to the ROAD_CENTERLINE polyline (point-to-segment)."""
+    t = np.clip(((px - _ROAD_A[:, 0]) * _ROAD_AB[:, 0]
+                 + (py - _ROAD_A[:, 1]) * _ROAD_AB[:, 1]) / _ROAD_L2, 0.0, 1.0)
+    fx = _ROAD_A[:, 0] + t * _ROAD_AB[:, 0]
+    fy = _ROAD_A[:, 1] + t * _ROAD_AB[:, 1]
+    return float(np.min(np.hypot(fx - px, fy - py)))
+
+
 # run16 paradigm reset: braking-aware target-speed profile, computed once over the reference
 # path (index-aligned with CENTERLINE / _cum_arc) -- now the RACING LINE. The reward rewards
 # matching it (slow-in) and the obs exposes it; this is what makes BRAKING emerge instead of
@@ -1092,9 +1111,10 @@ class BeamNGRaceEnv(gymnasium.Env):
         """The car left the ROAD. run20: distance is to the actual road centerline
         (ROAD_CENTERLINE), NOT the racing line -- deviating from the line is allowed,
         leaving the road is not. The on-road line sits <=4.2 m off-center, so following
-        it stays well inside the 8 m road-edge threshold."""
+        it stays well inside the 8 m road-edge threshold. run21: point-to-SEGMENT distance
+        (sparse road vertices made nearest-vertex distance spuriously fire off-track)."""
         pos = _shared["vehicle"].sensors["agent_state"]["pos"]
-        return min(_dist(pos, c) for c in ROAD_CENTERLINE) > OFF_TRACK_THRESHOLD_M
+        return _dist_to_road(pos[0], pos[1]) > OFF_TRACK_THRESHOLD_M
 
 
 # ---- Small math helpers ----
