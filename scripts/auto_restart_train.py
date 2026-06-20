@@ -109,9 +109,11 @@ def crashed(run):
         return False
 
 
-def launch(run, timesteps, lr, warm, steer_rate, random_spawn, blend=None, beta_offset=0):
+def launch(run, timesteps, lr, warm, steer_rate, random_spawn, blend=None, beta_offset=0,
+           residual_delta=None):
     """Launch a training segment as a child process, tee to console log. `blend`, if given, is
-    (beta_warmup, beta_anneal_end); beta_offset = global steps already done (fade is global)."""
+    (beta_warmup, beta_anneal_end); beta_offset = global steps already done (fade is global).
+    residual_delta, if given, enables run22's additive bounded residual hybrid."""
     os.makedirs("logs", exist_ok=True)
     cmd = [sys.executable, "train_beamng.py", "--run-name", run,
            "--timesteps", str(timesteps), "--nogpu", "--learning-rate", str(lr),
@@ -119,6 +121,8 @@ def launch(run, timesteps, lr, warm, steer_rate, random_spawn, blend=None, beta_
     if blend is not None:
         cmd += ["--blend-fade", "--beta-warmup", str(blend[0]),
                 "--beta-anneal-end", str(blend[1]), "--beta-offset", str(beta_offset)]
+    if residual_delta is not None:
+        cmd += ["--residual", "--residual-delta", str(residual_delta)]
     if warm:
         # WARM_LEARNING_STARTS > batch_size (256): on a self-heal the replay buffer
         # starts EMPTY (not saved), so learning_starts=0 made SAC's first train()
@@ -154,9 +158,13 @@ def main():
                          "tracks GLOBAL progress across warm-restarts.")
     ap.add_argument("--beta-warmup", type=int, default=100_000)
     ap.add_argument("--beta-anneal-end", type=int, default=400_000)
+    ap.add_argument("--residual", action="store_true",
+                    help="run22 additive bounded residual hybrid (threads --residual + delta).")
+    ap.add_argument("--residual-delta", type=float, default=0.12)
     args = ap.parse_args()
 
     blend = (args.beta_warmup, args.beta_anneal_end) if args.blend_fade else None
+    residual_delta = args.residual_delta if args.residual else None
     done = 0
     warm = args.warm
     seg = 0
@@ -166,7 +174,7 @@ def main():
         print(f"[supervisor] segment {seg}: run={run} remaining={remaining} "
               f"warm={warm or 'FRESH'}", flush=True)
         p, log = launch(run, remaining, args.lr, warm, args.steer_rate, args.random_spawn,
-                        blend=blend, beta_offset=done)
+                        blend=blend, beta_offset=done, residual_delta=residual_delta)
 
         outcome = None
         while True:

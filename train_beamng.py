@@ -38,6 +38,7 @@ from stable_baselines3.common.monitor import Monitor
 from envs.beamng_env import make_beamng_env, _shared
 from envs.base_controller import BaseController
 from envs.blend_sac import BlendSAC
+from envs.residual_hybrid import ResidualHybrid
 
 
 class TBEvalCallback(EvalCallback):
@@ -51,7 +52,8 @@ class TBEvalCallback(EvalCallback):
     termination-reason fractions (eval/term_<reason>)."""
     _TERMS = ("off_track", "flip", "stuck", "backward", "lap", "run")
     _MEAN_KEYS = ("mean_speed", "max_arc", "over_speed_frac", "beta_mean", "beta_p90",
-                  "checkpoints_reached", "r_progress", "r_match", "r_overspeed", "r_slip")
+                  "checkpoints_reached", "r_progress", "r_match", "r_overspeed", "r_slip",
+                  "residual_abs")   # run22: mean |applied residual| at eval (0 if absent -> plain run)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -195,6 +197,13 @@ def parse_args():
                    help="run21: global steps already completed before this segment. The wrapper "
                         "passes this on a warm-restart so beta tracks GLOBAL progress (num_timesteps "
                         "resets to 0 each segment). 0 for a fresh first segment.")
+    p.add_argument("--residual", action="store_true",
+                   help="run22 additive bounded residual hybrid: applied = clip(base_controller + "
+                        "clip(policy, +/-delta), -1, 1). Controller at FULL; the policy only trims. "
+                        "Eval runs the full hybrid (it's an env wrapper). Off by default.")
+    p.add_argument("--residual-delta", type=float, default=0.12,
+                   help="run22: residual authority bound (normalized action units). The policy can "
+                        "shift each control by at most this much on top of the controller.")
     return p.parse_args()
 
 
@@ -246,15 +255,24 @@ def main():
                          "max_slip", "steer_clip_frac",
                          "beta_max", "beta_mean",
                          "over_speed_mean", "over_speed_frac", "v_target_here")
+    # run22: additive bounded residual hybrid. The residual lives in an env WRAPPER (not a
+    # sampler hook) so eval (predict) also runs the FULL hybrid: applied = clip(controller +
+    # clip(residual, +/-delta), -1, 1). residual_abs is logged. Each env gets its OWN controller
+    # (shared controller state would cross-contaminate train<->eval).
+    if args.residual:
+        monitor_info_keys = monitor_info_keys + ("residual_abs",)
+    _train_core = make_beamng_env(
+        # run17 spawn curriculum: random_spawn distributes episode starts around the
+        # whole track (random idx + per-idx heading + start-speed capped at v_target),
+        # so every corner's line gets practiced instead of only T1-from-the-start-line.
+        random_spawn=args.random_spawn, home=args.home, host=args.host, port=args.port,
+        launch=args.launch, headless=args.headless, nogpu=args.nogpu,
+        steer_rate=args.steer_rate,
+    )
+    if args.residual:
+        _train_core = ResidualHybrid(_train_core, delta=args.residual_delta)
     train_env = Monitor(
-        make_beamng_env(
-            # run17 spawn curriculum: random_spawn distributes episode starts around the
-            # whole track (random idx + per-idx heading + start-speed capped at v_target),
-            # so every corner's line gets practiced instead of only T1-from-the-start-line.
-            random_spawn=args.random_spawn, home=args.home, host=args.host, port=args.port,
-            launch=args.launch, headless=args.headless, nogpu=args.nogpu,
-            steer_rate=args.steer_rate,
-        ),
+        _train_core,
         filename=str(log_dir / "train"),
         info_keywords=monitor_info_keys,
     )
@@ -266,6 +284,8 @@ def main():
         launch=False, headless=args.headless, nogpu=args.nogpu,
         steer_rate=args.steer_rate,
     )
+    if args.residual:
+        eval_env = ResidualHybrid(eval_env, delta=args.residual_delta)
 
     # SAC with SB3 sensible defaults for continuous control. buffer_size 1M holds
     # the whole 500k run; ent_coef "auto" self-tunes exploration. learning_rate
