@@ -24,6 +24,7 @@ from envs.beamng_env import (
     make_beamng_env, _shared, MAX_SPEED_M_S, CENTER_OFFSET_CLIP_M,
     MAX_LOOKAHEAD_DIST_M, LOOKAHEAD_DISTANCES_M,
     N_CHECKPOINTS, CHECKPOINT_BONUS, LAP_BONUS)
+from envs.residual_hybrid import ResidualHybrid
 
 DEFAULT_MODEL = "checkpoints/overnight_v1/best_model/best_model.zip"
 BEAMNG_HOME = r"C:\BeamNG\BeamNG.tech.v0.38.5.0"
@@ -202,6 +203,12 @@ def main():
     parser.add_argument("--spawn-idx", type=int, default=None,
                         help="Force spawn at specific centerline index "
                              "(default: env's normal spawn behavior)")
+    parser.add_argument("--residual", action="store_true",
+                        help="run22 additive bounded residual hybrid: wrap the env so the watched "
+                             "car drives the FULL hybrid (base_controller + clip(policy, +/-delta)), "
+                             "the same as training. The model is the plain-SAC residual policy.")
+    parser.add_argument("--residual-delta", type=float, default=0.12,
+                        help="run22: residual authority bound (must match the trained run; 0.12).")
     args = parser.parse_args()
     _enable_ansi()   # so the live panel can redraw in place (Windows-safe)
 
@@ -221,6 +228,13 @@ def main():
 
     # Visible window. No headless, no nogpu. We want to watch.
     env = make_beamng_env(home=BEAMNG_HOME, launch=True, headless=False, nogpu=False, random_spawn=False)
+    # run22: wrap so the watched car drives the FULL hybrid (controller + clipped residual),
+    # exactly as training does -- the model is just the residual policy. Without this the bare
+    # policy (a small +/-delta trim) would drive alone and go nowhere.
+    if args.residual:
+        env = ResidualHybrid(env, delta=args.residual_delta)
+        print(f"RESIDUAL HYBRID: base controller + clip(policy, +/-{args.residual_delta}); "
+              f"the DOES panel shows the APPLIED (controller+residual) action.")
 
     # Load the policy without caring which algorithm trained it: run1/run2 are
     # PPO, run3+ are SAC. Try each and use whichever loads cleanly, so this one
@@ -261,6 +275,11 @@ def main():
                 action, _ = model.predict(obs, deterministic=args.deterministic)
                 obs_seen = obs    # what the policy was given to decide this action
                 obs, reward, terminated, truncated, info = env.step(action)
+                # run22: the panel should show what the CAR did (controller+residual), not the
+                # bare policy trim. The wrapper stashes the applied action each step.
+                shown_action = getattr(env, "last_applied", None)
+                if shown_action is None:
+                    shown_action = action
                 ep_reward += float(reward)
                 ep_steps += 1
 
@@ -274,7 +293,7 @@ def main():
                     celebrate, celebrate_msg = 40, f"★★★ LAP! +{int(LAP_BONUS)} ★★★"
                 prev_cp = cp
 
-                lines = _readout(obs_seen, action) + _reward_lines(
+                lines = _readout(obs_seen, shown_action) + _reward_lines(
                     progress=float(info.get("final_reward", 0.0)),
                     cp_bonus=cp_bonus,
                     speed=float(info.get("speed_reward", 0.0)),

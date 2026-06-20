@@ -28,6 +28,8 @@ class ResidualHybrid(gymnasium.Wrapper):
         self.controller = controller if controller is not None else BaseController()
         self._res_sum = 0.0
         self._res_n = 0
+        self.last_applied = None      # watcher display: the controller+residual action actually sent
+        self.last_residual = None     # watcher display: the clipped residual the policy added
 
     def reset(self, **kwargs):
         self.controller.reset()
@@ -45,6 +47,7 @@ class ResidualHybrid(gymnasium.Wrapper):
         clipped = np.clip(residual, -self.delta, self.delta)         # bounded authority
         ctrl = self._controller_action()
         applied = np.clip(ctrl + clipped, -1.0, 1.0)                 # controller at FULL + residual
+        self.last_applied, self.last_residual = applied, clipped
         obs, reward, terminated, truncated, info = self.env.step(applied)
         # track mean |applied residual| over the episode (how hard the RL pushes)
         self._res_sum += float(np.mean(np.abs(clipped)))
