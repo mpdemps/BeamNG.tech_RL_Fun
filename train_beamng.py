@@ -50,7 +50,7 @@ class TBEvalCallback(EvalCallback):
     eval/over_speed_frac, eval/beta_mean, eval/beta_p90, eval/checkpoints_mean(+_max),
     the reward-term decomposition (eval/r_progress|r_match|r_overspeed|r_slip), and the
     termination-reason fractions (eval/term_<reason>)."""
-    _TERMS = ("off_track", "flip", "stuck", "backward", "lap", "run")
+    _TERMS = ("off_track", "flip", "stuck", "backward", "lap", "run", "loss_of_control")
     _MEAN_KEYS = ("mean_speed", "max_arc", "over_speed_frac", "beta_mean", "beta_p90",
                   "checkpoints_reached", "r_progress", "r_match", "r_overspeed", "r_slip",
                   "residual_abs")   # run22: mean |applied residual| at eval (0 if absent -> plain run)

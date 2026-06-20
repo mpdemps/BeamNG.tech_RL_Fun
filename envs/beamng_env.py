@@ -37,6 +37,7 @@ VEHICLE_PART_CONFIG = "vehicles/scintilla/race.pc"   # Race config (Mikey's pick
 VEHICLE_ID = "ego"
 PHYSICS_STEPS_PER_STEP = 3          # 3 steps at 60 Hz = 50 ms = 20 Hz env tick.
 DETERMINISTIC_STEPS_PER_S = 60
+DT_S = PHYSICS_STEPS_PER_STEP / DETERMINISTIC_STEPS_PER_S   # 0.05 s per env step (run23 yaw rate)
 MAX_SPEED_M_S = 70.0                # for obs normalization
 # Lookahead (run6 rebuild): the old observation looked at CENTERLINE[idx+1/2/3],
 # a ~13m horizon that SHRANK in corners (points cluster where the track curves).
@@ -201,6 +202,21 @@ BACKWARD_TERM_STEPS = 40    # ~2 s at the 20 Hz env tick; resets when nose recov
 # terminal fear generalizes to nearby fast-approach states (timidity is the
 # other observed failure mode) and -25 stays within the critic's target scale.
 BACKWARD_TERM_PENALTY = -25.0
+
+# run23 LOSS-OF-CONTROL termination (the "donut forever" fix). The watch + the run23 spin probe
+# showed run22 over-throttle the T1 exit and DONUT in place: a continuous spin that no existing
+# terminator catches -- backward needs 40 CONSECUTIVE backward steps but the spinning nose sweeps
+# through forward every revolution and RESETS the counter (probe max reached 13); stuck needs >200
+# no-progress steps but the spin's micro-progress resets it (max 13); off_track only fires if the
+# car drifts >8 m off the road, which a CONTAINED donut never does. So we detect the spin directly
+# by YAW RATE -- speed-independent (unlike beta, which pins to 0 below the ESC floor and would miss
+# a slow donut) and cleanly separated: clean cornering is yaw = v/R <= ~55 deg/s (tightest corner
+# R~13 m @ 12.6 m/s), the probe's spin sustained 150-262 deg/s. 150 deg/s sustained for 8 ticks
+# (~0.4 s) fires fast on a real spin and CANNOT trigger in clean cornering. LAP-PHASE choice: Phase 2
+# drift WANTS sustained high yaw, so this terminator is disabled/retuned for the drift phase.
+LOSS_OF_CONTROL_YAWRATE_DEG_S = 150.0
+LOSS_OF_CONTROL_STEPS = 8
+LOSS_OF_CONTROL_PENALTY = -10.0   # = crash/off-track penalty (a spin is a crash, per the plan)
 # Monotonic progress tracker: each step we re-find the car's centerline index by
 # searching only a LOCAL window around the last index, never globally. This
 # keeps cumulative distance continuous across the start/finish seam (idx 0 and
@@ -425,11 +441,12 @@ class BeamNGRaceEnv(gymnasium.Env):
         # run12 if it self-heals and re-imports this module). run13 sets 0.5.
         self.steer_rate = steer_rate
 
-        # 18 = speed + heading_err + center_off + 6 lookahead x (dist,bearing) + run16's
-        # [15] signed curvature preview, [16] v_target/V_MAX, [17] slip-angle (beta).
-        # NOTE: shape change -> pre-run16 models unloadable against this env.
+        # 19 = speed + heading_err + center_off + 6 lookahead x (dist,bearing) + run16's
+        # [15] signed curvature preview, [16] v_target/V_MAX, [17] slip-angle (beta) + run23's
+        # [18] normalized off-track distance (grip/off-road signal).
+        # NOTE: shape change -> pre-run23 models unloadable against this env (fresh policy).
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(18,), dtype=np.float32)
+            low=-1.0, high=1.0, shape=(19,), dtype=np.float32)
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
@@ -462,6 +479,9 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._min_heading_align = 1.0
         self._max_slip = 0.0
         self._last_beta = 0.0        # run14/16: last-step slip angle (deg); feeds obs + slip penalty
+        self._prev_nose_heading = None  # run23: last-step nose heading (rad); None = first step (no yaw yet)
+        self._yaw_rate_deg_s = 0.0      # run23: |d(nose heading)/dt| (deg/s); spin signal
+        self._loss_of_control_steps = 0  # run23: consecutive steps over the spin yaw-rate threshold
         self._max_beta = 0.0         # telemetry: episode max slip angle
         self._beta_sum = 0.0         # telemetry: for episode-mean slip angle
         self._beta_list = []         # logging-only: per-step beta for episode p90
@@ -622,6 +642,9 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._min_heading_align = 1.0
         self._max_slip = 0.0
         self._last_beta = 0.0        # run14/16: last-step slip angle (deg); feeds obs + slip penalty
+        self._prev_nose_heading = None  # run23: last-step nose heading (rad); None = first step (no yaw yet)
+        self._yaw_rate_deg_s = 0.0      # run23: |d(nose heading)/dt| (deg/s); spin signal
+        self._loss_of_control_steps = 0  # run23: consecutive steps over the spin yaw-rate threshold
         self._max_beta = 0.0         # telemetry: episode max slip angle
         self._beta_sum = 0.0         # telemetry: for episode-mean slip angle
         self._beta_list = []         # logging-only: per-step beta for episode p90
@@ -846,6 +869,10 @@ class BeamNGRaceEnv(gymnasium.Env):
         vals.append(float(np.clip(V_TARGET_PROFILE[idx] / PROFILE_V_MAX, -1.0, 1.0)))
         # [17] slip-angle beta (last step, one-step lag) — "are you sliding".
         vals.append(float(np.clip(self._last_beta / 45.0, -1.0, 1.0)))
+        # [18] run23 GRIP/OFF-TRACK signal: distance to the road, normalized by the 8 m off-track
+        # threshold -> 0.0 on the road, ramping to 1.0 at the edge (clipped). Lets the policy SEE
+        # it is running wide toward low-grip grass and rein the throttle in BEFORE off_track fires.
+        vals.append(float(np.clip(_dist_to_road(pos[0], pos[1]) / OFF_TRACK_THRESHOLD_M, 0.0, 1.0)))
         obs = np.array(vals, dtype=np.float32)
         return np.clip(obs, -1.0, 1.0)
 
@@ -907,6 +934,21 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._max_beta = max(self._max_beta, self._last_beta)
         self._beta_sum += self._last_beta
         self._beta_list.append(self._last_beta)   # logging-only: for per-episode beta p90
+        # run23 yaw rate (deg/s) = how fast the NOSE is rotating, from the change in dir heading.
+        # Speed-independent spin signal (unlike beta, pinned below ESC_MIN_SPEED). Drives the
+        # loss-of-control terminator; counts CONSECUTIVE steps over the spin threshold.
+        nose_heading = (math.atan2(fdir[1], fdir[0]) if hn > 1e-6
+                        else (self._prev_nose_heading or 0.0))
+        if self._prev_nose_heading is None:
+            self._yaw_rate_deg_s = 0.0          # first step after reset: no prior heading -> no spurious spike
+        else:
+            d_head = (nose_heading - self._prev_nose_heading + math.pi) % (2 * math.pi) - math.pi
+            self._yaw_rate_deg_s = abs(math.degrees(d_head)) / DT_S
+        self._prev_nose_heading = nose_heading
+        if self._yaw_rate_deg_s > LOSS_OF_CONTROL_YAWRATE_DEG_S:
+            self._loss_of_control_steps += 1
+        else:
+            self._loss_of_control_steps = 0
         if heading_align < HEADING_KILL_THRESHOLD:
             self._backward_steps += 1
         else:
@@ -1039,6 +1081,12 @@ class BeamNGRaceEnv(gymnasium.Env):
         if self._is_off_track():
             self._last_term_reason = "off_track"
             return True, OFF_TRACK_PENALTY
+        # run23 LOSS-OF-CONTROL: a sustained very-high yaw rate is a spin/donut, past any
+        # controlled slide -- terminate fast regardless of position (a contained on-road donut
+        # never trips off_track, and the spinning nose resets backward/stuck every revolution).
+        if self._loss_of_control_steps >= LOSS_OF_CONTROL_STEPS:
+            self._last_term_reason = "loss_of_control"
+            return True, LOSS_OF_CONTROL_PENALTY
         # Lap bonus only counts when forward-facing (run5): _lap_done is position-
         # based (seam crossing) and heading-blind, so gate it so a backward slide
         # across the seam can never collect the +100.
