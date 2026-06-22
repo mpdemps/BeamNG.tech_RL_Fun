@@ -110,7 +110,7 @@ def crashed(run):
 
 
 def launch(run, timesteps, lr, warm, steer_rate, random_spawn, blend=None, beta_offset=0,
-           residual_delta=None):
+           residual_delta=None, residual_throttle_up=None):
     """Launch a training segment as a child process, tee to console log. `blend`, if given, is
     (beta_warmup, beta_anneal_end); beta_offset = global steps already done (fade is global).
     residual_delta, if given, enables run22's additive bounded residual hybrid."""
@@ -123,6 +123,8 @@ def launch(run, timesteps, lr, warm, steer_rate, random_spawn, blend=None, beta_
                 "--beta-anneal-end", str(blend[1]), "--beta-offset", str(beta_offset)]
     if residual_delta is not None:
         cmd += ["--residual", "--residual-delta", str(residual_delta)]
+        if residual_throttle_up is not None:
+            cmd += ["--residual-throttle-up", str(residual_throttle_up)]
     if warm:
         # WARM_LEARNING_STARTS > batch_size (256): on a self-heal the replay buffer
         # starts EMPTY (not saved), so learning_starts=0 made SAC's first train()
@@ -161,6 +163,7 @@ def main():
     ap.add_argument("--residual", action="store_true",
                     help="run22 additive bounded residual hybrid (threads --residual + delta).")
     ap.add_argument("--residual-delta", type=float, default=0.12)
+    ap.add_argument("--residual-throttle-up", type=float, default=None)
     args = ap.parse_args()
 
     blend = (args.beta_warmup, args.beta_anneal_end) if args.blend_fade else None
@@ -174,7 +177,8 @@ def main():
         print(f"[supervisor] segment {seg}: run={run} remaining={remaining} "
               f"warm={warm or 'FRESH'}", flush=True)
         p, log = launch(run, remaining, args.lr, warm, args.steer_rate, args.random_spawn,
-                        blend=blend, beta_offset=done, residual_delta=residual_delta)
+                        blend=blend, beta_offset=done, residual_delta=residual_delta,
+                        residual_throttle_up=args.residual_throttle_up if args.residual else None)
 
         outcome = None
         while True:
