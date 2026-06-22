@@ -53,7 +53,8 @@ class TBEvalCallback(EvalCallback):
     _TERMS = ("off_track", "flip", "stuck", "backward", "lap", "run", "loss_of_control")
     _MEAN_KEYS = ("mean_speed", "max_arc", "over_speed_frac", "beta_mean", "beta_p90",
                   "checkpoints_reached", "r_progress", "r_match", "r_overspeed", "r_slip",
-                  "residual_abs")   # run22: mean |applied residual| at eval (0 if absent -> plain run)
+                  "residual_abs", "residual_abs_steer", "residual_abs_throttle")  # run22/24: mean
+                  # |applied residual| at eval, split per channel (0/absent -> plain run)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -204,6 +205,10 @@ def parse_args():
     p.add_argument("--residual-delta", type=float, default=0.12,
                    help="run22: residual authority bound (normalized action units). The policy can "
                         "shift each control by at most this much on top of the controller.")
+    p.add_argument("--residual-throttle-up", type=float, default=None,
+                   help="run24 throttle-authority cut: cap the POSITIVE throttle residual at this "
+                        "(e.g. 0.05) while steer stays +/-delta and throttle-down stays -delta. "
+                        "Limits over-throttle-into-spin; keeps full lift/brake. None = symmetric.")
     return p.parse_args()
 
 
@@ -260,7 +265,8 @@ def main():
     # clip(residual, +/-delta), -1, 1). residual_abs is logged. Each env gets its OWN controller
     # (shared controller state would cross-contaminate train<->eval).
     if args.residual:
-        monitor_info_keys = monitor_info_keys + ("residual_abs",)
+        monitor_info_keys = monitor_info_keys + ("residual_abs", "residual_abs_steer",
+                                                 "residual_abs_throttle")
     _train_core = make_beamng_env(
         # run17 spawn curriculum: random_spawn distributes episode starts around the
         # whole track (random idx + per-idx heading + start-speed capped at v_target),
@@ -270,7 +276,8 @@ def main():
         steer_rate=args.steer_rate,
     )
     if args.residual:
-        _train_core = ResidualHybrid(_train_core, delta=args.residual_delta)
+        _train_core = ResidualHybrid(_train_core, delta=args.residual_delta,
+                                     throttle_up=args.residual_throttle_up)
     train_env = Monitor(
         _train_core,
         filename=str(log_dir / "train"),
@@ -285,7 +292,8 @@ def main():
         steer_rate=args.steer_rate,
     )
     if args.residual:
-        eval_env = ResidualHybrid(eval_env, delta=args.residual_delta)
+        eval_env = ResidualHybrid(eval_env, delta=args.residual_delta,
+                                  throttle_up=args.residual_throttle_up)
 
     # SAC with SB3 sensible defaults for continuous control. buffer_size 1M holds
     # the whole 500k run; ent_coef "auto" self-tunes exploration. learning_rate

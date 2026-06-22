@@ -209,6 +209,9 @@ def main():
                              "the same as training. The model is the plain-SAC residual policy.")
     parser.add_argument("--residual-delta", type=float, default=0.12,
                         help="run22: residual authority bound (must match the trained run; 0.12).")
+    parser.add_argument("--residual-throttle-up", type=float, default=None,
+                        help="run24: cap the positive throttle residual (e.g. 0.05); must match the "
+                             "trained run. None = symmetric (run22/23).")
     args = parser.parse_args()
     _enable_ansi()   # so the live panel can redraw in place (Windows-safe)
 
@@ -232,8 +235,9 @@ def main():
     # exactly as training does -- the model is just the residual policy. Without this the bare
     # policy (a small +/-delta trim) would drive alone and go nowhere.
     if args.residual:
-        env = ResidualHybrid(env, delta=args.residual_delta)
-        print(f"RESIDUAL HYBRID: base controller + clip(policy, +/-{args.residual_delta}); "
+        env = ResidualHybrid(env, delta=args.residual_delta, throttle_up=args.residual_throttle_up)
+        print(f"RESIDUAL HYBRID: base controller + clip(policy, +/-{args.residual_delta}"
+              f"{'' if args.residual_throttle_up is None else f', throttle +{args.residual_throttle_up}'}); "
               f"the DOES panel shows the APPLIED (controller+residual) action.")
 
     # Load the policy without caring which algorithm trained it: run1/run2 are

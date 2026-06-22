@@ -22,18 +22,31 @@ from envs.base_controller import BaseController
 
 
 class ResidualHybrid(gymnasium.Wrapper):
-    def __init__(self, env, delta=0.12, controller=None):
+    """run24 THROTTLE-AUTHORITY CUT: the residual bound is now ASYMMETRIC PER CHANNEL.
+    steer stays +/-delta; throttle is [-delta, +throttle_up] with throttle_up << delta. Throttle
+    sign is positive=gas / negative=brake-lift (verified in base_controller), so capping the
+    POSITIVE throttle residual at ~+0.05 limits how much EXTRA gas the policy can pile on the
+    controller (the over-throttle-into-spin lever from run22/23), while -delta keeps full
+    lift/brake authority to shed grip-killing speed. throttle_up=None -> symmetric (run22/23)."""
+
+    def __init__(self, env, delta=0.12, throttle_up=None, controller=None):
         super().__init__(env)
         self.delta = float(delta)
+        # per-channel [low, high] for [steer, throttle]; throttle high capped at throttle_up
+        t_up = self.delta if throttle_up is None else float(throttle_up)
+        self.low = np.array([-self.delta, -self.delta], dtype=np.float32)
+        self.high = np.array([self.delta, t_up], dtype=np.float32)
         self.controller = controller if controller is not None else BaseController()
-        self._res_sum = 0.0
+        self._steer_sum = 0.0
+        self._thr_sum = 0.0
         self._res_n = 0
         self.last_applied = None      # watcher display: the controller+residual action actually sent
         self.last_residual = None     # watcher display: the clipped residual the policy added
 
     def reset(self, **kwargs):
         self.controller.reset()
-        self._res_sum = 0.0
+        self._steer_sum = 0.0
+        self._thr_sum = 0.0
         self._res_n = 0
         return self.env.reset(**kwargs)
 
@@ -44,13 +57,17 @@ class ResidualHybrid(gymnasium.Wrapper):
 
     def step(self, residual):
         residual = np.asarray(residual, dtype=np.float32).reshape(-1)
-        clipped = np.clip(residual, -self.delta, self.delta)         # bounded authority
+        clipped = np.clip(residual, self.low, self.high)             # asymmetric per-channel bound
         ctrl = self._controller_action()
         applied = np.clip(ctrl + clipped, -1.0, 1.0)                 # controller at FULL + residual
         self.last_applied, self.last_residual = applied, clipped
         obs, reward, terminated, truncated, info = self.env.step(applied)
-        # track mean |applied residual| over the episode (how hard the RL pushes)
-        self._res_sum += float(np.mean(np.abs(clipped)))
+        # track mean |applied residual| per channel over the episode (how hard the RL pushes each)
+        self._steer_sum += abs(float(clipped[0]))
+        self._thr_sum += abs(float(clipped[1]))
         self._res_n += 1
-        info["residual_abs"] = self._res_sum / max(self._res_n, 1)
+        n = max(self._res_n, 1)
+        info["residual_abs_steer"] = self._steer_sum / n
+        info["residual_abs_throttle"] = self._thr_sum / n
+        info["residual_abs"] = (self._steer_sum + self._thr_sum) / (2 * n)   # combined, for continuity
         return obs, reward, terminated, truncated, info
