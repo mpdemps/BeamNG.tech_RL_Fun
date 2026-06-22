@@ -39,6 +39,8 @@ class ResidualHybrid(gymnasium.Wrapper):
         self.controller = controller if controller is not None else BaseController()
         self._steer_sum = 0.0
         self._thr_sum = 0.0
+        self._thr_pos_sum = 0.0     # run24: sum of POSITIVE throttle residual (gas the policy adds)
+        self._thr_sat_n = 0         # run24: steps the +throttle residual is AT the +cap (saturating)
         self._res_n = 0
         self.last_applied = None      # watcher display: the controller+residual action actually sent
         self.last_residual = None     # watcher display: the clipped residual the policy added
@@ -47,6 +49,8 @@ class ResidualHybrid(gymnasium.Wrapper):
         self.controller.reset()
         self._steer_sum = 0.0
         self._thr_sum = 0.0
+        self._thr_pos_sum = 0.0
+        self._thr_sat_n = 0
         self._res_n = 0
         return self.env.reset(**kwargs)
 
@@ -65,9 +69,16 @@ class ResidualHybrid(gymnasium.Wrapper):
         # track mean |applied residual| per channel over the episode (how hard the RL pushes each)
         self._steer_sum += abs(float(clipped[0]))
         self._thr_sum += abs(float(clipped[1]))
+        # run24: isolate the +throttle CAP from lift usage. residual_throttle_pos = mean of the
+        # POSITIVE throttle residual (gas added); residual_throttle_satfrac = fraction of steps it
+        # sits AT the +cap (raw wanted >= cap -> clipped == high[1]) = how often the cut is binding.
+        self._thr_pos_sum += max(0.0, float(clipped[1]))
+        self._thr_sat_n += int(clipped[1] >= self.high[1] - 1e-6)
         self._res_n += 1
         n = max(self._res_n, 1)
         info["residual_abs_steer"] = self._steer_sum / n
         info["residual_abs_throttle"] = self._thr_sum / n
         info["residual_abs"] = (self._steer_sum + self._thr_sum) / (2 * n)   # combined, for continuity
+        info["residual_throttle_pos"] = self._thr_pos_sum / n
+        info["residual_throttle_satfrac"] = self._thr_sat_n / n
         return obs, reward, terminated, truncated, info

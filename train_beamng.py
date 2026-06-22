@@ -53,8 +53,9 @@ class TBEvalCallback(EvalCallback):
     _TERMS = ("off_track", "flip", "stuck", "backward", "lap", "run", "loss_of_control")
     _MEAN_KEYS = ("mean_speed", "max_arc", "over_speed_frac", "beta_mean", "beta_p90",
                   "checkpoints_reached", "r_progress", "r_match", "r_overspeed", "r_slip",
-                  "residual_abs", "residual_abs_steer", "residual_abs_throttle")  # run22/24: mean
-                  # |applied residual| at eval, split per channel (0/absent -> plain run)
+                  "residual_abs", "residual_abs_steer", "residual_abs_throttle",
+                  "residual_throttle_pos", "residual_throttle_satfrac")  # run22/24: mean |applied
+                  # residual| split per channel + signed +throttle mean and +cap saturation fraction
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -266,7 +267,8 @@ def main():
     # (shared controller state would cross-contaminate train<->eval).
     if args.residual:
         monitor_info_keys = monitor_info_keys + ("residual_abs", "residual_abs_steer",
-                                                 "residual_abs_throttle")
+                                                 "residual_abs_throttle", "residual_throttle_pos",
+                                                 "residual_throttle_satfrac")
     _train_core = make_beamng_env(
         # run17 spawn curriculum: random_spawn distributes episode starts around the
         # whole track (random idx + per-idx heading + start-speed capped at v_target),
