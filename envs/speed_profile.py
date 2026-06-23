@@ -12,8 +12,23 @@ import math
 A_LAT_MAX = 12.0     # m/s^2 target cornering grip (~1.22 g; below the ~1.6 g measured ceiling)
 A_BRAKE = 9.0        # m/s^2 braking decel for the backward pass (~0.9 g)
 A_ACCEL = 6.0        # m/s^2 corner-exit accel for the forward pass (traction-limited)
-V_MAX = 33.0         # m/s straight-line cap (the speed the car actually reaches)
+# run25: V_MAX raised 33 -> 55 to open the straights. Measured top speed is 62.8+ m/s (still
+# climbing in 300 m), so 55 is conservative. The backward braking pass self-caps any straight too
+# short to reach 55 from the prior corner, so this only speeds up straights with room -- the gate
+# verifies the controller still brakes in time. (obs[16] = v_target/V_MAX renormalizes: flag for
+# the eventual residual run -- a run24-warm policy would read corner speeds at a smaller obs value.)
+V_MAX = 55.0         # m/s straight-line cap
 CURV_SMOOTH_M = 14.0  # curvature smoothing window (m) -- the scale a corner is "felt"
+
+# run25 GRIP-AWARE cornering. The uniform A_LAT=12 over-asks where the road is downhill/off-camber
+# (the rear unloads -> less grip), which is the T11 spin (measured -23% grade at turn-in, by far the
+# steepest corner; Mike also confirmed off-camber by eye). Reduce A_LAT (a) PROPORTIONAL to the
+# smoothed downhill grade everywhere, and (b) an explicit OFF-CAMBER cap over the T11 complex.
+# Flat/uphill corners are UNCHANGED at A_LAT=12 (raising those is a later run, not run25).
+K_DOWNHILL = 1.5     # A_LAT *= (1 - K_DOWNHILL * downhill_grade); proportional grip loss on descents
+GRIP_FLOOR = 0.6     # min grip factor from the slope term alone (A_LAT >= 0.6*12 = 7.2)
+T11_ARC = (3530.0, 3620.0)  # arc range of the T11 right-then-left downhill complex (apex ~3574 m)
+A_LAT_T11 = 8.0      # m/s^2 hard cap in the T11 zone (off-camber flag): ~18% slower than 12
 
 
 def _dist(a, b):
@@ -26,7 +41,9 @@ def _angdiff(a, b):
 
 def compute_speed_profile(centerline,
                           a_lat_max=A_LAT_MAX, a_brake=A_BRAKE, a_accel=A_ACCEL,
-                          v_max=V_MAX, curv_smooth_m=CURV_SMOOTH_M):
+                          v_max=V_MAX, curv_smooth_m=CURV_SMOOTH_M,
+                          k_downhill=K_DOWNHILL, grip_floor=GRIP_FLOOR,
+                          t11_arc=T11_ARC, a_lat_t11=A_LAT_T11):
     """Return (v_target, R, cum_arc, track_length, kappa), each indexed by point.
 
     kappa is the SIGNED smoothed curvature (1/m, +/- for turn direction) — used by the
@@ -65,8 +82,26 @@ def compute_speed_profile(centerline,
         kappa[i] = acc / (2 * half + 1)
     R = [1.0 / max(abs(k), 1e-4) for k in kappa]
 
-    # 1) pointwise corner limit
-    v = [min(v_max, math.sqrt(a_lat_max * R[i])) for i in range(n)]
+    # run25 grip-aware per-point A_LAT. Smoothed longitudinal grade dz/d_arc (same window as
+    # curvature); downhill (negative grade) reduces grip proportionally; the T11 arc zone gets an
+    # explicit off-camber cap. Flat/uphill corners keep the full a_lat_max.
+    has_z = len(centerline[0]) > 2
+    grade_seg = [0.0] * n
+    for i in range(n):
+        ds = seg_len(i)
+        dz = (centerline[(i + 1) % n][2] - centerline[i][2]) if has_z else 0.0
+        grade_seg[i] = dz / ds if ds > 1e-6 else 0.0
+    a_lat = [0.0] * n
+    for i in range(n):
+        g = sum(grade_seg[j % n] for j in range(i - half, i + half + 1)) / (2 * half + 1)
+        factor = max(grip_floor, 1.0 - k_downhill * max(0.0, -g))   # downhill -> g<0 -> reduce
+        a = a_lat_max * factor
+        if t11_arc[0] <= cum[i] <= t11_arc[1]:                       # off-camber flag (manual)
+            a = min(a, a_lat_t11)
+        a_lat[i] = a
+
+    # 1) pointwise corner limit (per-point grip-aware A_LAT)
+    v = [min(v_max, math.sqrt(a_lat[i] * R[i])) for i in range(n)]
 
     # 2) backward (braking) pass, upstream: v[i] <= sqrt(v[i+1]^2 + 2*a_brake*ds).
     #    two loops around the ring so the closed loop converges.
