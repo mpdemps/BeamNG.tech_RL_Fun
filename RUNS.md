@@ -983,3 +983,298 @@ wall it keeps hitting. See `docs\mikey_run20_plan_racing_line.md`.
 - TensorBoard log dir: `logs\mikey_run19`
 - Best model: `checkpoints\mikey_run19\best_model\best_model.zip`
 - Plan: `docs\mikey_run19_plan_slip_penalty.md`
+
+---
+
+## run20_racing_line (SAC, warm from run18, 500k)
+
+### Date
+
+2026-06-19
+
+### Hyperparameters
+
+- Algorithm: SAC, warm from run18's best_model. plain SAC, gamma 0.99,
+  `--steer-rate 0.5`, `--random-spawn`.
+- Changes since last run (ONE coherent change): RETARGET the obs/reward reference
+  from the centerline to an offline MINIMUM-CURVATURE RACING LINE
+  (`envs\racing_line.py` + `data\raceline_builtin.py`, rolled ourselves, MIT-clean,
+  no LGPL TUM dep). Pure retarget: obs SHAPE unchanged (18 dims, just computed
+  relative to the line), no new reward terms, no edge-distance dims (we have no
+  authoritative edges). Off-track still measured vs the real ROAD centerline (8m),
+  not the line. Slip penalty REVERTED to run18's gentle W_SLIP=0.05/BETA_DEAD=9
+  (run19's 0.15/7.0 caused corner-avoidance). Plan:
+  `docs\mikey_run20_plan_racing_line.md`.
+
+### Timesteps
+
+500,000
+
+### Peak Eval Reward
+
+~680 (eval mean_reward, mid-run ~150-180k). max_arc peaked ~270 smoothed (best
+~347), mean_speed ~20-24 m/s.
+
+### Final Eval Reward
+
+Degraded past the peak (the run20 instability): max_arc fell back toward ~250,
+reward off its peak. Never cleared T1 cleanly / no completed lap.
+
+### Watching Notes
+
+G14 watch of the peak best_model (3x): the BEST driving of the project so far. It
+follows the racing line and ENTERS T1 well (2 of 3 runs). Two failures remain:
+(1) the old left-right WEAVE on the straights, (2) OVER-BRAKING while turning, so
+the rear overtakes the front (trail-brake oversteer) because it arrives ~100 kph
+and brakes late/hard mid-corner. And pure RL on the line PLATEAUED then degraded
+(peaked ~150-180k, declined after), never punching through. The line concept is
+sound (it fixed run19's corner-avoidance); pure RL just hit the compute ceiling.
+
+### Mikey's Hypothesis for Next Run
+
+The line works, but the AI can't smoothly execute it on its own at our compute
+(one machine). Give it training wheels: a hand-coded autopilot that follows the
+line and brakes at the right spots, and let the AI ride on top making small
+corrections (residual RL). The autopilot does the smooth driving the AI keeps
+getting slightly wrong. See `docs\mikey_run21_plan_residual_fadeout.md`.
+
+### Artifacts
+
+- TensorBoard log dir: `logs\mikey_run20`
+- Best model: `checkpoints\mikey_run20\best_model\best_model.zip`
+- Plan: `docs\mikey_run20_plan_racing_line.md`
+
+---
+
+## run21_residual_fadeout (SAC/BlendSAC, warm from run18, 600k)
+
+### Date
+
+2026-06-19
+
+### Hyperparameters
+
+- Algorithm: BlendSAC (guided residual with CONTROLLER FADE-OUT). Warm from run18.
+  600k total: beta=1 warmup (0-100k), linear anneal 1->0 (100k-400k), beta=0 hold
+  (400k-600k). EVAL ALWAYS at beta=0 (measures the standalone policy).
+- Built `envs\base_controller.py`: pure-pursuit steering + speed-profile P
+  throttle/brake. The controller ALONE LAPS the full track (first thing in the
+  project to lap 4326 m), MIT-clean. Also fixed a latent off-track bug
+  (`_is_off_track` was point-to-VERTEX on the sparse centerline; changed to
+  point-to-SEGMENT), which had been silently false-killing back-half spawn
+  episodes since run17.
+- Goal: fade the controller out so the END PRODUCT is a PURE learned policy
+  (training wheels removed). Plan: `docs\mikey_run21_plan_residual_fadeout.md`.
+
+### Timesteps
+
+600,000
+
+### Peak Eval Reward
+
+The beta=0 (solo) policy came alive in the back half of the anneal (~330k): max_arc
+climbed to ~162 (best ~234), beta_p90 fell from ~160 to ~30, reward climbed. That
+was the peak.
+
+### Final Eval Reward
+
+Degraded in the beta=0 hold. Once the controller was fully gone, the solo policy
+fell apart (max_arc back to ~70-90). The peak (~234) was still SHORT of T1's entry
+(294 m).
+
+### Watching Notes
+
+G14 watch of the peak best_model (the solo beta=0 policy): it is a WEAVING CRAWLER.
+Floors it briefly, backs off, accelerates very slowly to ~30 kph weaving, slows to
+a stop, then reverses. VERDICT: full controller removal FAILED at our compute. The
+policy leaned entirely on the controller and could not drive solo. The eval reward
+that climbed to ~300 at the peak was flattered by the match term paying for the
+crawl, the cards-lying trap again, your eyes were the truth.
+
+### Mikey's Hypothesis for Next Run
+
+A fully self-driving AI is beyond this one machine (the famous result needed 1000+
+machines). So keep the controller permanently and let the AI add small polish on
+top, a controller-led hybrid. The car laps for sure (the controller does it), and
+the AI improves it where it can. See `docs\mikey_run22_plan_residual_hybrid.md`.
+
+### Artifacts
+
+- TensorBoard log dirs: `logs\mikey_run21`, `logs\mikey_run21_resume`
+- Best model: `checkpoints\mikey_run21\best_model\best_model.zip`
+- New code: `envs\base_controller.py` (the lapping controller), `envs\blend_sac.py`
+- Plan: `docs\mikey_run21_plan_residual_fadeout.md`
+
+---
+
+## run22_residual_hybrid (SAC, FRESH, 500k)
+
+### Date
+
+2026-06-19
+
+### Hyperparameters
+
+- Algorithm: plain SAC, FRESH. ADDITIVE BOUNDED RESIDUAL:
+  `applied = controller(obs) + clip(policy(obs), +/-0.12)` (`envs\residual_hybrid.py`).
+  Controller at FULL (laps by construction); the RL adds a small bounded
+  correction it can never use to collapse the car. Eval = the FULL hybrid.
+  Controller-alone lap logged as the fixed baseline. Reward unchanged.
+- Changes since last run: switched from the convex fade-out blend to the additive
+  bounded residual (controller-led, not policy-led). Plan:
+  `docs\mikey_run22_plan_residual_hybrid.md`.
+
+### Timesteps
+
+500,000
+
+### Peak / Final Eval Reward
+
+The hybrid laps controller-led; the residual reached far past T1 from the warm
+foundation. Numbers not the trustworthy signal here (see watch).
+
+### Watching Notes
+
+G14 watch of best_model: the controller takes the racing line through T1 cleanly,
+but the RESIDUAL over-throttles on the T1 EXIT and SPINS, then does full-throttle
+DONUTS that NEVER TERMINATE, even out in the grass. VERDICT: a contained in-place
+donut stays within the 8m off-track radius, and no terminator catches it (off_track
+is position-based; backward/stuck timers reset every revolution). The
+non-terminating donut corrupts the buffer AND flatters the eval (long episodes that
+never end), so the residual never gets a clean penalty for over-throttling.
+
+### Mikey's Hypothesis for Next Run
+
+The car doesn't know it's off the road on grass, so it keeps flooring it, and a
+spun-out car never stops to learn its mistake. Add a spin detector that ends the
+episode (a hard stop when it loses control) and give the car a sense of when it's
+off-track on low grip, so it learns to ease off. See
+`docs\mikey_run23_plan_grip_awareness.md`.
+
+### Artifacts
+
+- TensorBoard log dir: `logs\mikey_run22`
+- Best model: `checkpoints\mikey_run22\best_model\best_model.zip`
+- New code: `envs\residual_hybrid.py`
+- Plan: `docs\mikey_run22_plan_residual_hybrid.md`
+
+---
+
+## run23_grip_awareness (SAC, FRESH, 500k; power-outage resume)
+
+### Date
+
+2026-06-19 to 2026-06-20
+
+### Hyperparameters
+
+- Algorithm: plain SAC, FRESH. Kept the run22 residual hybrid (controller +
+  clip(policy, +/-0.12)). Three-part grip-awareness bundle:
+  1. LOSS-OF-CONTROL terminator: yaw rate > 150 deg/s sustained 8 ticks (~0.4s) ->
+     end episode + crash penalty (-10). Catches the contained donut regardless of
+     position. (Yaw rate chosen over slip-angle beta: beta pins to 0 below the
+     8 m/s floor, so a slow donut would evade it; yaw is speed-independent.)
+  2. GRIP obs[18] = normalized dist-to-road (0 on road -> 1 at edge). obs 18->19.
+  3. Off_track investigation: confirmed working; the donut was a spin-detector gap,
+     not an off_track bug.
+- Plan: `docs\mikey_run23_plan_grip_awareness.md`.
+
+### Timesteps
+
+500,000 (power outage killed the mini at ~380k; resumed cleanly from
+rolling_380000 to 500k, namespace `mikey_run23_resume`).
+
+### Peak Eval Reward
+
+~7,776 (pre-outage peak, ~370-380k). max_arc reached ~3,500 m (best ~3,594), about
+81% of the 4326 m lap, mean_speed ~28 m/s. CORNERING PARALYSIS SOLVED (far past the
+old T1 wall).
+
+### Final Eval Reward
+
+The resume was high-variance and degraded (swung 127-5339, ended low). Never
+completed a lap (term_lap = 0 throughout). Still spinning at ~3,500 m
+(term_loss_of_control ~0.33-1.0 on the far evals).
+
+### Watching Notes
+
+G14 watch of the pre-outage peak best_model: drives WELL, reaches turn 12/13 (= T11
+in the reference) before spinning. T11 is a sharp right-hander that is OFF-CAMBER
+and DOWNHILL. Also: does not take the optimal line on a few fast/gentle corners
+(the min-curvature line stays near center on gentle bends), and the back straight
+is capped at ~114 kph (the artificial V_MAX=33 cap; diagnostic showed 75% of the
+lap capped there, and a measured top speed of 62.8+ m/s shows huge headroom).
+
+### Mikey's Hypothesis for Next Run
+
+The donut/buffer fix worked and the car nearly laps. The remaining spin is at T11,
+and the throttle is the suspected lever (the residual stomping gas mid-corner). Cut
+the residual's ability to ADD throttle but keep its ability to LIFT (asymmetric
+cap), so it can save a slide but can't floor itself into a spin. See
+`docs\mikey_run24_plan_throttle_authority_cut.md`.
+
+### Artifacts
+
+- TensorBoard log dirs: `logs\mikey_run23`, `logs\mikey_run23_resume`
+- Best model: `checkpoints\mikey_run23\best_model\best_model.zip` (pre-outage peak)
+- Plan: `docs\mikey_run23_plan_grip_awareness.md`
+
+---
+
+## run24_throttle_authority_cut (SAC, warm from run23, 500k)
+
+### Date
+
+2026-06-20 to 2026-06-21
+
+### Hyperparameters
+
+- Algorithm: plain SAC, WARM from run23 MAIN best_model. ASYMMETRIC per-channel
+  residual bound (`envs\residual_hybrid.py`): steering +/-0.12 (full), throttle
+  [-0.12, +0.05] (full LIFT, ADD-throttle cut hard). Sign verified: positive =
+  throttle, negative = brake/lift. Added SIGNED throttle metrics
+  (residual_throttle_pos, residual_throttle_satfrac) to isolate the +cap binding
+  from lift usage. Reward unchanged. Plan:
+  `docs\mikey_run24_plan_throttle_authority_cut.md`.
+
+### Timesteps
+
+500,000
+
+### Peak Eval Reward
+
+~7,800 (matching run23). BEST PROGRESS of any run: max_arc ~3,500 m (~81%),
+mean_speed ~28 m/s (up from the ~24 norm).
+
+### Final Eval Reward
+
+No completed lap (term_lap = 0 throughout). Still spinning at ~3,500 m (T11).
+Critically, residual_throttle_satfrac stayed PINNED at ~0.70 the entire run: the
+policy is jammed against the +0.05 throttle cap (wants more gas) AND still spins.
+So the throttle residual is NOT the remaining spin cause, the throttle lever is
+EXHAUSTED. The donut corruption is gone (episodes terminate cleanly throughout).
+
+### Watching Notes
+
+G14 watch of best_model: 114 kph max (the V_MAX=33 cap), mild left-right weave on
+straights, loses it at T11 every time (sharp right, off-camber, downhill). Top-speed
+probe measured 62.8 m/s (226 kph) in just the 300m opening straight, still climbing,
+so V_MAX=33 is throttling the car to under half its capability. Slope diagnostic
+later confirmed T11 is a -23% grade at turn-in, uniquely the steepest corner on the
+track (next worst -3%), which is why its rear is the lightest and it is the spin wall.
+
+### Mikey's Hypothesis for Next Run
+
+The throttle lever is used up, and the spin is one specific corner: T11, which is
+steeply downhill and off-camber so the rear is light there. The speed profile
+assumes the same grip everywhere, so it asks too much speed at T11. Make the profile
+GRIP-AWARE: open up the straights (raise V_MAX from 33 toward 55+), and slow down
+the off-camber/downhill corners like T11 to give the grip margin back. Go fast AND
+finish the lap. See `docs\mikey_run25_plan_grip_aware_profile.md` (and the
+`run24_raceline_diagnostic` / top-speed findings).
+
+### Artifacts
+
+- TensorBoard log dir: `logs\mikey_run24`
+- Best model: `checkpoints\mikey_run24\best_model\best_model.zip`
+- Plan: `docs\mikey_run24_plan_throttle_authority_cut.md`
