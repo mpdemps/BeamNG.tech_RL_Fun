@@ -1278,3 +1278,137 @@ finish the lap. See `docs\mikey_run25_plan_grip_aware_profile.md` (and the
 - TensorBoard log dir: `logs\mikey_run24`
 - Best model: `checkpoints\mikey_run24\best_model\best_model.zip`
 - Plan: `docs\mikey_run24_plan_throttle_authority_cut.md`
+
+---
+
+## run25_grip_aware_profile (SAC, FRESH, 500k)
+
+### Date
+
+2026-06-21 to 2026-06-24
+
+### Hyperparameters
+
+- Algorithm: plain SAC, FRESH, lr 3e-4. Residual hybrid kept (controller +
+  clip(policy, steer +/-0.12, throttle -0.12/+0.05)). GRIP-AWARE speed profile
+  (`envs\speed_profile.py`): V_MAX 33 -> 55 (straights open to ~187 kph), and
+  per-corner A_LAT trimmed by downhill slope + an explicit off-camber cap A_LAT=8
+  over T11 (v_target there -18%). Flat corners unchanged at 12.
+- Slope measurement (the key finding): T11 is a -23% grade at turn-in, UNIQUELY
+  the steepest (next worst -3%), which is why its rear is the lightest and it is
+  the spin wall. Controller-alone gate: laps the new fast profile cleanly,
+  survives T11. Plan: `docs\mikey_run25_plan_grip_aware_profile.md`.
+
+### Timesteps
+
+500,000 (single clean segment, no freeze-restarts).
+
+### Peak / Final Eval Reward
+
+REGRESSION. Peak max_arc ~2,494 m (~58%), WORSE than run24's ~3,500 m. No lap
+(term_lap = 0 throughout). The policy never converged, it oscillated between
+decent runs (~2,500 m) and T11 spin-outs (~85-120 m) the whole way, ending ugly.
+
+### Watching Notes
+
+G14 watch of the peak (~330k) best_model: same T11 spin as run24, plus the mild
+straight weave. The decisive cards: residual_abs_steer pinned at the full 0.12
+EVERY eval (the policy wants more authority than the +/-0.12 box allows), and
+term_loss_of_control swinging to 1.0 on the craters, correlated with high
+residual_throttle_satfrac. VERDICT: three flavors of bounded residual now
+(run22 additive, run24 throttle-cut, run25 grip-profile) ALL plateau the same
+way, a controller that laps alone + a saturated small residual = an unstable
+hybrid that spins, never a lap. The bounded residual is the wrong lever; the
+policy fights the controller at its cap and destabilizes it. Bigger picture: at
+our one-machine compute, RL in EVERY form tried (pure run20/21, residual
+22/24/25) either cannot drive the track or destabilizes the controller. The only
+thing that laps the whole track is the hand-coded controller.
+
+### Mikey's Hypothesis for Next Run
+
+The real villain across all 25 runs is the CAR: a 748hp rear-drive race car that
+spins at the slightest provocation. The RL has been failing to tame an unforgiving
+supercar, not failing to drive. Switch to a car that can BOTH lap and drift: the
+GTS (road) config of the same Scintilla, same RWD V10 so it still drifts, but
+detuned + street tires + softer suspension so its limit is gentle and learnable.
+See the "Car switch" note below.
+
+### Artifacts
+
+- TensorBoard log dir: `logs\mikey_run25`
+- Best model: `checkpoints\mikey_run25\best_model\best_model.zip`
+- Plan: `docs\mikey_run25_plan_grip_aware_profile.md`
+
+---
+
+## Car switch: RACE -> GTS (the "do-both" platform)
+
+### Date
+
+2026-06-24
+
+### Why
+
+25 runs proved the bottleneck is the car, not the pipeline. The Scintilla RACE
+config (748hp RWD, race tires/coilovers/wing/LSD) has a razor-edge limit that
+punishes any imprecision, so pure RL plateaus and the residual destabilizes. Mike
+asked for ONE car that can both LAP and DRIFT. The answer is RWD with enough power
+to drift but a forgiving, progressive limit so it is learnable, which is exactly
+the GTS (road) config of the same car.
+
+### GTS vs RACE (measured)
+
+- Same 5.0 V10 + RWD (still drifts; has a factory drift mode), but DETUNED: stock
+  ECU (8600 rpm) vs race ECU (9000-10500), sport intake. Top speed 76 m/s (274
+  kph) vs race 87 m/s (314 kph).
+- Grip ~0.8x race (~1.3g true vs ~1.6g), street sport tires (narrower,
+  progressive) vs race compound, softer adaptive suspension, open diff (race has
+  LSD), no wing. Gentler breakaway (170 vs 243 deg/s step-steer).
+- The proof of the softer limit: the race controller laps its profile, but the
+  GTS spins out at T6 on that exact setup, it cannot hold race speeds, so it needs
+  its own gentler profile.
+
+### Recalibration (architecture UNCHANGED)
+
+Only car-specific constants moved (`envs\speed_profile.py` GTS variant):
+A_LAT_MAX 12 -> 10, A_BRAKE 9 -> 7, A_ACCEL 6 -> 5, V_MAX 55 -> 50, T11 cap
+8 -> 6.5. Controller steering (pure-pursuit) gains transferred as-is; the data did
+not call for speed/brake gain changes, so they were left untouched. Obs (19-dim),
+reward, racing line, and the residual-hybrid architecture all carry over.
+
+### The gate (controller alone, no policy)
+
+LAP @ 83.1s, max_arc 4329 m, term=lap, peak 47.3 m/s (170 kph). Every corner OK,
+INCLUDING both T11 segments (the off-camber downhill corner that wrecked runs
+18-25). The forgiving do-both platform is proven. Map: `docs\gts_gate_map.png`.
+
+---
+
+## run26_purerl_gts (SAC, FRESH, 500k) -- IN PROGRESS
+
+### Date
+
+2026-06-24 (launched)
+
+### Hyperparameters
+
+- Algorithm: plain SAC, FRESH. PURE RL: NO controller, NO residual, the policy
+  outputs the full steering + throttle and learns to drive from scratch. Keeps
+  the racing-line reward, the 19-dim grip-aware obs, the loss-of-control spin
+  terminator, the GTS grip-aware profile, --steer-rate 0.5, --random-spawn.
+- The test: can the RL learn to lap a car that COOPERATES (the GTS), where it
+  plateaued on the unforgiving race car (run20)? This is the project's core
+  question. Pre-flight probe + 7k smoke passed (plumbing clean, terminators fire,
+  no NaN; the fresh policy only crawls at ~3.7 m/s, as expected). Smoke note: 10
+  of 40 episodes ended in a FLIP, the taller/softer GTS rolls where the race car
+  spun; watch eval/term_flip.
+
+### Verdict
+
+TBD (running). The read: eval/max_arc climbing toward 4326 as a LEARNED lap, with
+term_off_track / term_flip / term_loss_of_control falling and mean_speed climbing.
+
+### Artifacts
+
+- TensorBoard log dir: `logs\mikey_run26`
+- Launcher: `scripts\run_mikey26.sh`
