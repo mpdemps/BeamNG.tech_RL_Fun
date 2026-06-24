@@ -31,9 +31,14 @@ MAP_NAME = "west_coast_usa"
 VEHICLE_MODEL = "scintilla"         # Civetta Scintilla; model codename verified
                                     # via bng.vehicles.get_available(). Phase 2
                                     # car, much faster than run1's etk800 sedan.
-VEHICLE_PART_CONFIG = "vehicles/scintilla/race.pc"   # Race config (Mikey's pick,
-                                    # not default gts). Exact .pc path verified
-                                    # inside content/vehicles/scintilla.zip.
+VEHICLE_PART_CONFIG = "vehicles/scintilla/gts.pc"   # GTS (road) config -- the
+                                    # "do-both" LAP+DRIFT car: same 5.0 V10 RWD
+                                    # (still drifts, factory drift mode) but
+                                    # detuned (stock ECU), street sport-plus tires,
+                                    # softer adaptive suspension, open diff -> a
+                                    # gentler, more learnable limit (~0.8x race
+                                    # grip). Switched from race.pc for runs 26+.
+                                    # .pc path verified in scintilla.zip.
 VEHICLE_ID = "ego"
 PHYSICS_STEPS_PER_STEP = 3          # 3 steps at 60 Hz = 50 ms = 20 Hz env tick.
 DETERMINISTIC_STEPS_PER_S = 60

@@ -8,27 +8,32 @@ the offline probe. Pure geometry, no BeamNG.
 """
 import math
 
-# --- constants (run16; tune in the smoke per the calibration gate) ---
-A_LAT_MAX = 12.0     # m/s^2 target cornering grip (~1.22 g; below the ~1.6 g measured ceiling)
-A_BRAKE = 9.0        # m/s^2 braking decel for the backward pass (~0.9 g)
-A_ACCEL = 6.0        # m/s^2 corner-exit accel for the forward pass (traction-limited)
-# run25: V_MAX raised 33 -> 55 to open the straights. Measured top speed is 62.8+ m/s (still
-# climbing in 300 m), so 55 is conservative. The backward braking pass self-caps any straight too
-# short to reach 55 from the prior corner, so this only speeds up straights with room -- the gate
-# verifies the controller still brakes in time. (obs[16] = v_target/V_MAX renormalizes: flag for
-# the eventual residual run -- a run24-warm policy would read corner speeds at a smaller obs value.)
-V_MAX = 55.0         # m/s straight-line cap
-CURV_SMOOTH_M = 14.0  # curvature smoothing window (m) -- the scale a corner is "felt"
+# --- constants: GTS (road) config, runs 26+. Recalibrated down from the run25 RACE values to the
+#     GTS's softer, lower limit (~0.8x race grip; street sport-plus tires + adaptive suspension +
+#     open diff + detuned 5.0 V10). RACE values kept in comments for provenance. ---
+A_LAT_MAX = 10.0     # m/s^2 target cornering grip (~1.0 g). RACE was 12 (~1.22 g); GTS skidpad
+                     # measured ~0.8x the race grip, so scale the target down to match.
+A_BRAKE = 7.0        # m/s^2 braking decel for the backward pass (~0.71 g). RACE 9: steel brakes +
+                     # street tires bite less than the race carbon/slick setup.
+A_ACCEL = 5.0        # m/s^2 corner-exit accel for the forward pass. RACE 6: detuned engine + OPEN
+                     # diff (vs race LSD) spins the inside wheel sooner -> weaker traction-limited exit.
+# V_MAX: clean mid-straight GTS launch measured 76 m/s (274 kph) and LEVELED OFF (true top speed),
+# vs the race car's 87 m/s. Cap at 50 (66% of top), the same conservative fraction the race profile
+# used (55 of 87 = 63%). The backward braking pass self-caps any straight too short to reach 50, so
+# this only opens straights with room -- the gate verifies the controller still brakes in time.
+# (obs[16] = v_target/V_MAX renormalizes on the new V_MAX -- fine, the residual trains fresh on GTS.)
+V_MAX = 50.0         # m/s straight-line cap (RACE 55)
+CURV_SMOOTH_M = 14.0  # curvature smoothing window (m) -- the scale a corner is "felt" (unchanged)
 
-# run25 GRIP-AWARE cornering. The uniform A_LAT=12 over-asks where the road is downhill/off-camber
-# (the rear unloads -> less grip), which is the T11 spin (measured -23% grade at turn-in, by far the
-# steepest corner; Mike also confirmed off-camber by eye). Reduce A_LAT (a) PROPORTIONAL to the
-# smoothed downhill grade everywhere, and (b) an explicit OFF-CAMBER cap over the T11 complex.
-# Flat/uphill corners are UNCHANGED at A_LAT=12 (raising those is a later run, not run25).
+# GRIP-AWARE cornering (carried over from run25, scaled to GTS). The uniform A_LAT over-asks where
+# the road is downhill/off-camber (the rear unloads -> less grip), which was the T11 spin (measured
+# -23% grade at turn-in, by far the steepest corner; Mike confirmed off-camber by eye). Reduce A_LAT
+# (a) PROPORTIONAL to the smoothed downhill grade everywhere, and (b) an explicit OFF-CAMBER cap over
+# the T11 complex. Flat/uphill corners keep the full A_LAT_MAX.
 K_DOWNHILL = 1.5     # A_LAT *= (1 - K_DOWNHILL * downhill_grade); proportional grip loss on descents
-GRIP_FLOOR = 0.6     # min grip factor from the slope term alone (A_LAT >= 0.6*12 = 7.2)
+GRIP_FLOOR = 0.6     # min grip factor from the slope term alone (A_LAT >= 0.6*10 = 6.0)
 T11_ARC = (3530.0, 3620.0)  # arc range of the T11 right-then-left downhill complex (apex ~3574 m)
-A_LAT_T11 = 8.0      # m/s^2 hard cap in the T11 zone (off-camber flag): ~18% slower than 12
+A_LAT_T11 = 6.5      # m/s^2 hard cap in the T11 zone (off-camber flag). RACE 8: GTS-scaled.
 
 
 def _dist(a, b):
