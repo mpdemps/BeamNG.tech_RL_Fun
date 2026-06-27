@@ -53,6 +53,7 @@ class TBEvalCallback(EvalCallback):
     _TERMS = ("off_track", "flip", "stuck", "backward", "lap", "run", "loss_of_control")
     _MEAN_KEYS = ("mean_speed", "max_arc", "over_speed_frac", "beta_mean", "beta_p90",
                   "checkpoints_reached", "r_progress", "r_match", "r_overspeed", "r_slip",
+                  "r_drift", "beta_err_mean", "drift_corner_steps",  # run27 drift card
                   "residual_abs", "residual_abs_steer", "residual_abs_throttle",
                   "residual_throttle_pos", "residual_throttle_satfrac")  # run22/24: mean |applied
                   # residual| split per channel + signed +throttle mean and +cap saturation fraction
@@ -210,6 +211,11 @@ def parse_args():
                    help="run24 throttle-authority cut: cap the POSITIVE throttle residual at this "
                         "(e.g. 0.05) while steer stays +/-delta and throttle-down stays -delta. "
                         "Limits over-throttle-into-spin; keeps full lift/brake. None = symmetric.")
+    p.add_argument("--drift", action="store_true",
+                   help="run27 Phase 2: build the env in DRIFT mode -- the GTS drift car (drift mode "
+                        "+ LSD diff), obs gains the beta_target dim (20-dim), the reward becomes the "
+                        "corner-gated slip-angle MATCH (not the grip slip penalty), and the terminator "
+                        "allows controlled drifts. Logs r_drift + beta_err_mean. Off by default.")
     return p.parse_args()
 
 
@@ -269,13 +275,15 @@ def main():
         monitor_info_keys = monitor_info_keys + ("residual_abs", "residual_abs_steer",
                                                  "residual_abs_throttle", "residual_throttle_pos",
                                                  "residual_throttle_satfrac")
+    if args.drift:
+        monitor_info_keys = monitor_info_keys + ("r_drift", "beta_err_mean", "drift_corner_steps")
     _train_core = make_beamng_env(
         # run17 spawn curriculum: random_spawn distributes episode starts around the
         # whole track (random idx + per-idx heading + start-speed capped at v_target),
         # so every corner's line gets practiced instead of only T1-from-the-start-line.
         random_spawn=args.random_spawn, home=args.home, host=args.host, port=args.port,
         launch=args.launch, headless=args.headless, nogpu=args.nogpu,
-        steer_rate=args.steer_rate,
+        steer_rate=args.steer_rate, drift_mode=args.drift,
     )
     if args.residual:
         _train_core = ResidualHybrid(_train_core, delta=args.residual_delta,
@@ -291,7 +299,7 @@ def main():
     eval_env = make_beamng_env(
         random_spawn=False, home=args.home, host=args.host, port=args.port,
         launch=False, headless=args.headless, nogpu=args.nogpu,
-        steer_rate=args.steer_rate,
+        steer_rate=args.steer_rate, drift_mode=args.drift,
     )
     if args.residual:
         eval_env = ResidualHybrid(eval_env, delta=args.residual_delta,

@@ -550,6 +550,8 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._over_pen_sum = 0.0
         self._slip_pen_sum = 0.0
         self._drift_sum = 0.0        # run27: per-episode sum of the drift-match bonus (drift_mode)
+        self._drift_corner_steps = 0 # run27: steps spent in a corner (where the drift reward is live)
+        self._beta_err_sum = 0.0     # run27: sum of |beta - beta_target| over those steps (drift card)
         self._over_speed_sum = 0.0   # run16 telemetry: sum of max(0, v - v_target) per step
         self._over_speed_steps = 0   # run18 telemetry: count of steps over v_target
         self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
@@ -715,6 +717,8 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._over_pen_sum = 0.0
         self._slip_pen_sum = 0.0
         self._drift_sum = 0.0        # run27: per-episode sum of the drift-match bonus (drift_mode)
+        self._drift_corner_steps = 0 # run27: steps spent in a corner (where the drift reward is live)
+        self._beta_err_sum = 0.0     # run27: sum of |beta - beta_target| over those steps (drift card)
         self._over_speed_sum = 0.0   # run16 telemetry: sum of max(0, v - v_target) per step
         self._over_speed_steps = 0   # run18 telemetry: count of steps over v_target
         self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
@@ -806,6 +810,8 @@ class BeamNGRaceEnv(gymnasium.Env):
             "r_overspeed": float(self._over_pen_sum),
             "r_slip": float(self._slip_pen_sum),
             "r_drift": float(self._drift_sum),
+            "beta_err_mean": float(self._beta_err_sum / max(self._drift_corner_steps, 1)),
+            "drift_corner_steps": int(self._drift_corner_steps),
             "over_speed_mean": float(self._over_speed_sum / max(self._ep_steps, 1)),
             "over_speed_frac": float(self._over_speed_steps / max(self._ep_steps, 1)),
             "v_target_here": float(V_TARGET_PROFILE[self._progress_idx]),
@@ -1103,6 +1109,8 @@ class BeamNGRaceEnv(gymnasium.Env):
             v_target = float(V_TARGET_PROFILE[self._progress_idx])  # telemetry parity only
             over = 0.0
             self._drift_sum += drift_bonus
+            self._drift_corner_steps += 1                 # drift card: how much drifting was scored
+            self._beta_err_sum += abs(self._last_beta - bt)  # and how close to the target angle
         else:
             drift_bonus = 0.0
             # run16: progress is the cover-the-track core (kept). The speed-EVERYWHERE term,

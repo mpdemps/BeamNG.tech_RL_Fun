@@ -110,7 +110,7 @@ def crashed(run):
 
 
 def launch(run, timesteps, lr, warm, steer_rate, random_spawn, blend=None, beta_offset=0,
-           residual_delta=None, residual_throttle_up=None):
+           residual_delta=None, residual_throttle_up=None, drift=False):
     """Launch a training segment as a child process, tee to console log. `blend`, if given, is
     (beta_warmup, beta_anneal_end); beta_offset = global steps already done (fade is global).
     residual_delta, if given, enables run22's additive bounded residual hybrid."""
@@ -125,6 +125,8 @@ def launch(run, timesteps, lr, warm, steer_rate, random_spawn, blend=None, beta_
         cmd += ["--residual", "--residual-delta", str(residual_delta)]
         if residual_throttle_up is not None:
             cmd += ["--residual-throttle-up", str(residual_throttle_up)]
+    if drift:
+        cmd += ["--drift"]
     if warm:
         # WARM_LEARNING_STARTS > batch_size (256): on a self-heal the replay buffer
         # starts EMPTY (not saved), so learning_starts=0 made SAC's first train()
@@ -164,6 +166,8 @@ def main():
                     help="run22 additive bounded residual hybrid (threads --residual + delta).")
     ap.add_argument("--residual-delta", type=float, default=0.12)
     ap.add_argument("--residual-throttle-up", type=float, default=None)
+    ap.add_argument("--drift", action="store_true",
+                    help="run27 Phase 2: drift mode (threads --drift to train_beamng).")
     args = ap.parse_args()
 
     blend = (args.beta_warmup, args.beta_anneal_end) if args.blend_fade else None
@@ -178,7 +182,8 @@ def main():
               f"warm={warm or 'FRESH'}", flush=True)
         p, log = launch(run, remaining, args.lr, warm, args.steer_rate, args.random_spawn,
                         blend=blend, beta_offset=done, residual_delta=residual_delta,
-                        residual_throttle_up=args.residual_throttle_up if args.residual else None)
+                        residual_throttle_up=args.residual_throttle_up if args.residual else None,
+                        drift=args.drift)
 
         outcome = None
         while True:
