@@ -39,6 +39,11 @@ VEHICLE_PART_CONFIG = "vehicles/scintilla/gts.pc"   # GTS (road) config -- the
                                     # gentler, more learnable limit (~0.8x race
                                     # grip). Switched from race.pc for runs 26+.
                                     # .pc path verified in scintilla.zip.
+# run27 Phase 2 DRIFT config: the GTS + factory drift mode (defaultMode=drift) + the LSD rear
+# diff (differential_R_race) so the rear steps out predictably. Lives in the repo (data/gts_drift.pc)
+# and is deployed into the BeamNG userfolder by _deploy_drift_pc() so it resolves by this VFS path.
+# Only used when make_beamng_env(drift_mode=True); Phase 1 keeps the plain GTS above.
+VEHICLE_PART_CONFIG_DRIFT = "vehicles/scintilla/gts_drift.pc"
 VEHICLE_ID = "ego"
 PHYSICS_STEPS_PER_STEP = 3          # 3 steps at 60 Hz = 50 ms = 20 Hz env tick.
 DETERMINISTIC_STEPS_PER_S = 60
@@ -283,6 +288,33 @@ DEFAULT_PORT = 25252
 from data.centerline_racetrack_builtin import CENTERLINE as ROAD_CENTERLINE
 from data.raceline_builtin import RACELINE
 from envs.speed_profile import compute_speed_profile, V_MAX as PROFILE_V_MAX
+# run27 Phase 2 drift scaffolding (pure functions; only used when drift_mode=True).
+from envs.drift import (beta_target as _beta_target, drift_reward as _drift_reward,
+                        is_drift_spin as _is_drift_spin,
+                        DRIFT_SPIN_STEPS, DRIFT_NO_PROGRESS_STEPS)
+
+
+def _deploy_drift_pc(home: Optional[str] = None) -> str:
+    """Copy the repo's data/gts_drift.pc into the BeamNG userfolder vehicles dir so BeamNG can
+    resolve VEHICLE_PART_CONFIG_DRIFT ('vehicles/scintilla/gts_drift.pc') from its VFS. Returns the
+    destination path. Idempotent. Raises if the userfolder can't be found (so a drift run fails
+    loudly rather than silently spawning the wrong car)."""
+    import os, glob, shutil
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "data", "gts_drift.pc")
+    if not os.path.isfile(src):
+        raise FileNotFoundError(f"drift .pc not in repo: {src}")
+    # BeamNGpy is launched with user=None, so BeamNG uses its default userfolder. Find the
+    # version dir that the VFS mounts ('.../BeamNG.tech/<ver|current>/'); deploy under vehicles/.
+    roots = sorted(glob.glob(os.path.expanduser("~/.local/share/BeamNG*/BeamNG.tech/current"))
+                   + glob.glob(os.path.expanduser("~/.local/share/BeamNG*/BeamNG.tech/0.*")))
+    if not roots:
+        raise FileNotFoundError("BeamNG userfolder not found under ~/.local/share/BeamNG*/BeamNG.tech")
+    dst_dir = os.path.join(roots[-1], "vehicles", "scintilla")
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, "gts_drift.pc")
+    shutil.copyfile(src, dst)
+    return dst
 
 # run20 RETARGET: the car now navigates by the offline min-curvature RACING LINE, not the road
 # center. Rebinding CENTERLINE -> RACELINE makes EVERY progress / lookahead / heading_err /
@@ -335,6 +367,15 @@ W_MATCH = 0.10         # run18 anti-timid nudge: +W_MATCH * min(v, v_target) * a
 OVER_SPEED_OFFSET = 0.0  # m/s; start the over-speed penalty this far BELOW v_target so the
                          # gradient is nonzero AT target (fixes the zero-gradient margin).
                          # 0 = off; raise in the smoke if reward-optimal speed runs hot.
+
+# run27 Phase 2 DRIFT reward weights (only used when drift_mode). r_drift is the 0..1 slip-angle
+# match bump (envs/drift.py), the progress term keeps the car covering ground (no spin-in-place).
+# Both are gated by forward velocity-alignment. MIKEY OWNS THIS BALANCE -- these are starting
+# defaults he shapes at review (drift showy vs keep moving).
+W_DRIFT = 1.0           # weight on the slip-angle match bump (peaks when |beta| == beta_target)
+W_DRIFT_PROGRESS = 0.3  # weight on forward progress in drift mode (vs W_PROG=1.0 for the grip lap):
+                        # lower so the agent isn't paid to just drive fast & straight, but nonzero
+                        # so a drift that stops going anywhere (donut-in-place) is not the optimum.
 BETA_SLIP_DEAD = 9.0   # deg; run20 REVERTED from run19's 7.0 back to run18's 9.0 (clean tracking
                        # p90 ~5deg, slides 17-46deg). run19's 7.0 + W_SLIP 0.15 made the car avoid
                        # corners; the racing line now provides the line, slip is a light backstop.
@@ -429,7 +470,8 @@ class BeamNGRaceEnv(gymnasium.Env):
     def __init__(self, random_spawn: bool, home: Optional[str] = None,
                  host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                  launch: bool = False, headless: bool = False,
-                 nogpu: bool = False, steer_rate: float = 0.0):
+                 nogpu: bool = False, steer_rate: float = 0.0,
+                 drift_mode: bool = False):
         super().__init__()
         # Connection params are stored here; we actually open BeamNG lazily
         # in reset(), so constructing the env never fails on its own.
@@ -440,6 +482,10 @@ class BeamNGRaceEnv(gymnasium.Env):
         self.launch = launch
         self.headless = headless
         self.nogpu = nogpu
+        # run27 Phase 2: drift_mode switches the obs (+1 beta_target dim), the reward (slip-angle
+        # MATCH instead of the grip slip PENALTY), and the terminator (allow a controlled drift,
+        # fire on a true spin). Default False = Phase 1 grip-lap behavior fully unchanged.
+        self.drift_mode = drift_mode
         # run13 steering slew-rate limit: symmetric cap on |Δsteer|/step (action[0]).
         # 0.0 = OFF (default), so the shared env file does not change behavior for any
         # run that does not explicitly enable it (protects the concurrently-running
@@ -450,8 +496,11 @@ class BeamNGRaceEnv(gymnasium.Env):
         # [15] signed curvature preview, [16] v_target/V_MAX, [17] slip-angle (beta) + run23's
         # [18] normalized off-track distance (grip/off-road signal).
         # NOTE: shape change -> pre-run23 models unloadable against this env (fresh policy).
+        # run27 drift_mode adds obs[19] = beta_target/45 (the slide angle being asked for), so the
+        # obs is 20-dim in drift mode. A drift policy is fresh anyway, so the shape bump is clean.
+        n_obs = 20 if drift_mode else 19
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(19,), dtype=np.float32)
+            low=-1.0, high=1.0, shape=(n_obs,), dtype=np.float32)
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
@@ -487,6 +536,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._prev_nose_heading = None  # run23: last-step nose heading (rad); None = first step (no yaw yet)
         self._yaw_rate_deg_s = 0.0      # run23: |d(nose heading)/dt| (deg/s); spin signal
         self._loss_of_control_steps = 0  # run23: consecutive steps over the spin yaw-rate threshold
+        self._drift_spin_steps = 0       # run27: consecutive "spun & not progressing" steps (drift)
         self._max_beta = 0.0         # telemetry: episode max slip angle
         self._beta_sum = 0.0         # telemetry: for episode-mean slip angle
         self._beta_list = []         # logging-only: per-step beta for episode p90
@@ -494,6 +544,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._match_sum = 0.0
         self._over_pen_sum = 0.0
         self._slip_pen_sum = 0.0
+        self._drift_sum = 0.0        # run27: per-episode sum of the drift-match bonus (drift_mode)
         self._over_speed_sum = 0.0   # run16 telemetry: sum of max(0, v - v_target) per step
         self._over_speed_steps = 0   # run18 telemetry: count of steps over v_target
         self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
@@ -650,6 +701,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._prev_nose_heading = None  # run23: last-step nose heading (rad); None = first step (no yaw yet)
         self._yaw_rate_deg_s = 0.0      # run23: |d(nose heading)/dt| (deg/s); spin signal
         self._loss_of_control_steps = 0  # run23: consecutive steps over the spin yaw-rate threshold
+        self._drift_spin_steps = 0       # run27: consecutive "spun & not progressing" steps (drift)
         self._max_beta = 0.0         # telemetry: episode max slip angle
         self._beta_sum = 0.0         # telemetry: for episode-mean slip angle
         self._beta_list = []         # logging-only: per-step beta for episode p90
@@ -657,6 +709,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._match_sum = 0.0
         self._over_pen_sum = 0.0
         self._slip_pen_sum = 0.0
+        self._drift_sum = 0.0        # run27: per-episode sum of the drift-match bonus (drift_mode)
         self._over_speed_sum = 0.0   # run16 telemetry: sum of max(0, v - v_target) per step
         self._over_speed_steps = 0   # run18 telemetry: count of steps over v_target
         self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
@@ -747,6 +800,7 @@ class BeamNGRaceEnv(gymnasium.Env):
             "r_match": float(self._match_sum),
             "r_overspeed": float(self._over_pen_sum),
             "r_slip": float(self._slip_pen_sum),
+            "r_drift": float(self._drift_sum),
             "over_speed_mean": float(self._over_speed_sum / max(self._ep_steps, 1)),
             "over_speed_frac": float(self._over_speed_steps / max(self._ep_steps, 1)),
             "v_target_here": float(V_TARGET_PROFILE[self._progress_idx]),
@@ -878,6 +932,11 @@ class BeamNGRaceEnv(gymnasium.Env):
         # threshold -> 0.0 on the road, ramping to 1.0 at the edge (clipped). Lets the policy SEE
         # it is running wide toward low-grip grass and rein the throttle in BEFORE off_track fires.
         vals.append(float(np.clip(_dist_to_road(pos[0], pos[1]) / OFF_TRACK_THRESHOLD_M, 0.0, 1.0)))
+        # [19] run27 DRIFT target slip angle at the current speed, normalized like beta (/45). Only
+        # present in drift_mode -> the policy sees the angle it is being asked to hold RIGHT NOW
+        # (alongside beta=obs[17] and speed=obs[0]); the gap obs[17]-obs[19] is "how far off target".
+        if self.drift_mode:
+            vals.append(float(np.clip(_beta_target(speed) / 45.0, -1.0, 1.0)))
         obs = np.array(vals, dtype=np.float32)
         return np.clip(obs, -1.0, 1.0)
 
@@ -958,6 +1017,16 @@ class BeamNGRaceEnv(gymnasium.Env):
             self._backward_steps += 1
         else:
             self._backward_steps = 0
+        # run27 DRIFT spin detector: count consecutive steps that look SPUN (slip past the band, or
+        # nose pointing backward). A controlled drift holds |beta| in the band with the nose forward,
+        # so this stays at 0; a sustained spin accumulates and fires in _check_done. (Replaces the
+        # yaw-rate terminator in drift mode -- a drift flick spikes yaw without being a spin. The
+        # no-forward-progress donut is a SEPARATE catch, the drift stuck timer.)
+        if self.drift_mode:
+            if _is_drift_spin(self._last_beta, heading_align):
+                self._drift_spin_steps += 1
+            else:
+                self._drift_spin_steps = 0
 
         # run7 instrumentation (logging only). A "recovery" = a genuine dip
         # (>= 3 consecutive steps below the kill threshold) that ends with the
@@ -1004,29 +1073,49 @@ class BeamNGRaceEnv(gymnasium.Env):
 
         # Gate: clamp negative to zero so backward driving earns no reward.
         gated_alignment = max(0.0, raw_alignment)
-        # run16: progress is the cover-the-track core (kept). The speed-EVERYWHERE term,
-        # the steering/throttle smoothness penalties, and the wheelspin spin_penalty are
-        # all DROPPED -- braking/cornering are LEARNED via the two terms below.
-        final_reward = W_PROG * raw_progress * gated_alignment
 
-        # THE BRAKE SIGNAL: penalize exceeding the braking-aware target speed at the car's
-        # position (squared: gentle near target, sharp when hot). OVER_SPEED_OFFSET shifts
-        # the knee below v_target so the gradient is nonzero AT target (calibration knob).
-        v_target = float(V_TARGET_PROFILE[self._progress_idx])
-        over = max(0.0, speed_horizontal - (v_target - OVER_SPEED_OFFSET))
-        over_speed_penalty = -W_OVER * over * over
+        if self.drift_mode:
+            # run27 DRIFT reward: reward holding |beta| at the speed-scaled beta_target (the 0..1
+            # match bump), plus a SMALL forward-progress term so the car keeps covering ground
+            # rather than spinning in place. Both gated by forward velocity-alignment (a backward
+            # or parked spin earns nothing -> the on-track + forward-progress gates the plan asks
+            # for). The grip-lap terms (over-speed brake signal, anti-timid match, and crucially the
+            # slip PENALTY that fights drift) are all OFF here. Mikey tunes the W_DRIFT/W_DRIFT_
+            # PROGRESS balance at review.
+            bt = _beta_target(speed_horizontal)
+            drift_bonus = W_DRIFT * _drift_reward(self._last_beta, bt) * gated_alignment
+            final_reward = W_DRIFT_PROGRESS * raw_progress * gated_alignment
+            over_speed_penalty = 0.0
+            match_reward = 0.0
+            slip_penalty = 0.0
+            v_target = float(V_TARGET_PROFILE[self._progress_idx])  # telemetry parity only
+            over = 0.0
+            self._drift_sum += drift_bonus
+        else:
+            drift_bonus = 0.0
+            # run16: progress is the cover-the-track core (kept). The speed-EVERYWHERE term,
+            # the steering/throttle smoothness penalties, and the wheelspin spin_penalty are
+            # all DROPPED -- braking/cornering are LEARNED via the two terms below.
+            final_reward = W_PROG * raw_progress * gated_alignment
+
+            # THE BRAKE SIGNAL: penalize exceeding the braking-aware target speed at the car's
+            # position (squared: gentle near target, sharp when hot). OVER_SPEED_OFFSET shifts
+            # the knee below v_target so the gradient is nonzero AT target (calibration knob).
+            v_target = float(V_TARGET_PROFILE[self._progress_idx])
+            over = max(0.0, speed_horizontal - (v_target - OVER_SPEED_OFFSET))
+            over_speed_penalty = -W_OVER * over * over
+
+            # run18 anti-timid nudge: reward carrying speed UP TO the target (capped at
+            # v_target so it adds no incentive to exceed it; alignment-gated so off-line
+            # speed earns nothing). This is what breaks the timid crawl.
+            match_reward = W_MATCH * min(speed_horizontal, v_target) * gated_alignment
+
+            # Slip-angle penalty (replaces ESC + the wheelspin spin_penalty): a reward signal
+            # to not slide, so the policy LEARNS grip instead of having throttle cut. beta deg.
+            slip_penalty = -W_SLIP * max(0.0, self._last_beta - BETA_SLIP_DEAD)
         self._over_speed_sum += over
         if over > 0.01:
             self._over_speed_steps += 1
-
-        # run18 anti-timid nudge: reward carrying speed UP TO the target (capped at
-        # v_target so it adds no incentive to exceed it; alignment-gated so off-line
-        # speed earns nothing). This is what breaks the timid crawl.
-        match_reward = W_MATCH * min(speed_horizontal, v_target) * gated_alignment
-
-        # Slip-angle penalty (replaces ESC + the wheelspin spin_penalty): a reward signal
-        # to not slide, so the policy LEARNS grip instead of having throttle cut. beta deg.
-        slip_penalty = -W_SLIP * max(0.0, self._last_beta - BETA_SLIP_DEAD)
 
         # logging-only: per-episode sums of each reward term so TB can show real progress
         # apart from the match term ("paid to crawl"). Behavior-neutral.
@@ -1070,8 +1159,9 @@ class BeamNGRaceEnv(gymnasium.Env):
                 checkpoint_bonus += CHECKPOINT_BONUS
         # run16 total: progress + checkpoints − over-speed − slip-angle. The over-speed
         # term is the brake signal; progress rewards covering ground at/below v_target.
+        # run27 drift_mode: drift_bonus is the slip-angle MATCH; the grip terms above are 0.
         return float(final_reward + checkpoint_bonus + over_speed_penalty + slip_penalty
-                     + match_reward)
+                     + match_reward + drift_bonus)
 
     def _check_done(self) -> Tuple[bool, float]:
         """Did the episode end? If so, what bonus or penalty applies?
@@ -1086,10 +1176,19 @@ class BeamNGRaceEnv(gymnasium.Env):
         if self._is_off_track():
             self._last_term_reason = "off_track"
             return True, OFF_TRACK_PENALTY
-        # run23 LOSS-OF-CONTROL: a sustained very-high yaw rate is a spin/donut, past any
-        # controlled slide -- terminate fast regardless of position (a contained on-road donut
-        # never trips off_track, and the spinning nose resets backward/stuck every revolution).
-        if self._loss_of_control_steps >= LOSS_OF_CONTROL_STEPS:
+        # LOSS-OF-CONTROL terminator.
+        # run27 drift_mode: do NOT use the yaw-rate signal (a drift flick spikes yaw without being a
+        # spin). A true spin = slip past the band / nose backward WHILE not progressing, sustained
+        # for DRIFT_SPIN_STEPS (counted in _compute_reward). A controlled drift keeps progressing,
+        # so its counter stays 0 and the episode continues.
+        # Phase 1 (run23): a sustained very-high yaw rate is a spin/donut -- terminate fast
+        # regardless of position (a contained on-road donut never trips off_track, and the spinning
+        # nose resets backward/stuck every revolution).
+        if self.drift_mode:
+            if self._drift_spin_steps >= DRIFT_SPIN_STEPS:
+                self._last_term_reason = "loss_of_control"
+                return True, LOSS_OF_CONTROL_PENALTY
+        elif self._loss_of_control_steps >= LOSS_OF_CONTROL_STEPS:
             self._last_term_reason = "loss_of_control"
             return True, LOSS_OF_CONTROL_PENALTY
         # Lap bonus only counts when forward-facing (run5): _lap_done is position-
@@ -1106,7 +1205,10 @@ class BeamNGRaceEnv(gymnasium.Env):
         if self._backward_steps >= BACKWARD_TERM_STEPS:
             self._last_term_reason = "backward"
             return True, BACKWARD_TERM_PENALTY
-        if self._steps_since_progress > STUCK_STEPS_THRESHOLD:
+        # run27 drift_mode uses a tighter no-progress window (donut-in-place should end sooner than
+        # the 200-step Phase 1 stuck timer); Phase 1 keeps STUCK_STEPS_THRESHOLD.
+        stuck_thresh = DRIFT_NO_PROGRESS_STEPS if self.drift_mode else STUCK_STEPS_THRESHOLD
+        if self._steps_since_progress > stuck_thresh:
             self._last_term_reason = "stuck"
             return True, STUCK_PENALTY
         self._last_term_reason = "run"
@@ -1220,9 +1322,19 @@ def _yaw_to_quat(yaw: float):
 def make_beamng_env(random_spawn: bool, home: Optional[str] = None,
                     host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                     launch: bool = False, headless: bool = False,
-                    nogpu: bool = False, steer_rate: float = 0.0):
-    """Return a fresh BeamNGRaceEnv. No rtgym wrapping in v1."""
+                    nogpu: bool = False, steer_rate: float = 0.0,
+                    drift_mode: bool = False):
+    """Return a fresh BeamNGRaceEnv. No rtgym wrapping in v1.
+
+    run27 drift_mode: deploy the drift .pc into the BeamNG userfolder and point the spawn at it
+    (factory drift mode + LSD diff), and switch the env's obs/reward/terminator to drift. Default
+    False = the Phase 1 grip-lap env, unchanged."""
+    if drift_mode:
+        global VEHICLE_PART_CONFIG
+        _deploy_drift_pc(home)
+        VEHICLE_PART_CONFIG = VEHICLE_PART_CONFIG_DRIFT
     return BeamNGRaceEnv(
         random_spawn=random_spawn, home=home, host=host, port=port,
         launch=launch, headless=headless, nogpu=nogpu, steer_rate=steer_rate,
+        drift_mode=drift_mode,
     )
