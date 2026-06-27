@@ -290,7 +290,7 @@ from data.raceline_builtin import RACELINE
 from envs.speed_profile import compute_speed_profile, V_MAX as PROFILE_V_MAX
 # run27 Phase 2 drift scaffolding (pure functions; only used when drift_mode=True).
 from envs.drift import (beta_target as _beta_target, drift_reward as _drift_reward,
-                        is_drift_spin as _is_drift_spin,
+                        is_drift_spin as _is_drift_spin, BETA_TARGET_OBS_NORM,
                         DRIFT_SPIN_STEPS, DRIFT_NO_PROGRESS_STEPS)
 
 
@@ -376,6 +376,11 @@ W_DRIFT = 1.0           # weight on the slip-angle match bump (peaks when |beta|
 W_DRIFT_PROGRESS = 0.3  # weight on forward progress in drift mode (vs W_PROG=1.0 for the grip lap):
                         # lower so the agent isn't paid to just drive fast & straight, but nonzero
                         # so a drift that stops going anywhere (donut-in-place) is not the optimum.
+# run27 (Mikey): the drift-match reward is gated to CORNERS only. Where the smoothed racing-line
+# curvature |kappa| exceeds this, the car is rewarded for drifting; on straights (below it) the
+# drift term is 0 and the normal grip progress/speed reward applies (drive straight, fast). ~1/85 m
+# (R < ~85 m) picks the real turns on this track while leaving the long straights ungated.
+DRIFT_CORNER_KAPPA = 0.012  # 1/m; |kappa| above this = a corner (drift zone)
 BETA_SLIP_DEAD = 9.0   # deg; run20 REVERTED from run19's 7.0 back to run18's 9.0 (clean tracking
                        # p90 ~5deg, slides 17-46deg). run19's 7.0 + W_SLIP 0.15 made the car avoid
                        # corners; the racing line now provides the line, slip is a light backstop.
@@ -932,11 +937,13 @@ class BeamNGRaceEnv(gymnasium.Env):
         # threshold -> 0.0 on the road, ramping to 1.0 at the edge (clipped). Lets the policy SEE
         # it is running wide toward low-grip grass and rein the throttle in BEFORE off_track fires.
         vals.append(float(np.clip(_dist_to_road(pos[0], pos[1]) / OFF_TRACK_THRESHOLD_M, 0.0, 1.0)))
-        # [19] run27 DRIFT target slip angle at the current speed, normalized like beta (/45). Only
-        # present in drift_mode -> the policy sees the angle it is being asked to hold RIGHT NOW
-        # (alongside beta=obs[17] and speed=obs[0]); the gap obs[17]-obs[19] is "how far off target".
+        # [19] run27 DRIFT target slip angle at the current speed. Only present in drift_mode -> the
+        # policy sees the angle it is being asked to hold RIGHT NOW (alongside beta=obs[17] and
+        # speed=obs[0]). Normalized by BETA_TARGET_OBS_NORM (the BIG-regime max, ~40 deg), NOT the
+        # small starting target, so a later warm-start that raises DRIFT_SCALE grows this obs value
+        # consistently instead of re-scaling under the policy.
         if self.drift_mode:
-            vals.append(float(np.clip(_beta_target(speed) / 45.0, -1.0, 1.0)))
+            vals.append(float(np.clip(_beta_target(speed) / BETA_TARGET_OBS_NORM, -1.0, 1.0)))
         obs = np.array(vals, dtype=np.float32)
         return np.clip(obs, -1.0, 1.0)
 
@@ -1074,14 +1081,19 @@ class BeamNGRaceEnv(gymnasium.Env):
         # Gate: clamp negative to zero so backward driving earns no reward.
         gated_alignment = max(0.0, raw_alignment)
 
-        if self.drift_mode:
-            # run27 DRIFT reward: reward holding |beta| at the speed-scaled beta_target (the 0..1
-            # match bump), plus a SMALL forward-progress term so the car keeps covering ground
-            # rather than spinning in place. Both gated by forward velocity-alignment (a backward
-            # or parked spin earns nothing -> the on-track + forward-progress gates the plan asks
-            # for). The grip-lap terms (over-speed brake signal, anti-timid match, and crucially the
-            # slip PENALTY that fights drift) are all OFF here. Mikey tunes the W_DRIFT/W_DRIFT_
-            # PROGRESS balance at review.
+        # run27 (Mikey): the drift-match reward is active only in CORNERS (curvature above
+        # threshold). On straights the car reverts to the grip progress/speed reward (drive straight,
+        # fast); in corners it is rewarded for drifting. So it learns to drift AROUND corners, not
+        # everywhere. (Forward-progress gating via gated_alignment applies in both -> no spin-in-place.)
+        is_corner = abs(float(_PROFILE_KAPPA[self._progress_idx])) > DRIFT_CORNER_KAPPA
+
+        if self.drift_mode and is_corner:
+            # DRIFT reward: reward holding |beta| at the speed-scaled beta_target (the 0..1 match
+            # bump), plus a SMALL forward-progress term so the car keeps covering ground rather than
+            # spinning in place. Both gated by forward velocity-alignment (a backward or parked spin
+            # earns nothing). The grip-lap terms (over-speed brake signal, anti-timid match, and
+            # crucially the slip PENALTY that fights drift) are all OFF in a corner. Mikey tunes the
+            # W_DRIFT/W_DRIFT_PROGRESS balance at review.
             bt = _beta_target(speed_horizontal)
             drift_bonus = W_DRIFT * _drift_reward(self._last_beta, bt) * gated_alignment
             final_reward = W_DRIFT_PROGRESS * raw_progress * gated_alignment
