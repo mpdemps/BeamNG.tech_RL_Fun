@@ -25,6 +25,7 @@ from envs.beamng_env import (
     MAX_LOOKAHEAD_DIST_M, LOOKAHEAD_DISTANCES_M,
     N_CHECKPOINTS, CHECKPOINT_BONUS, LAP_BONUS)
 from envs.residual_hybrid import ResidualHybrid
+from envs.drift import BETA_TARGET_OBS_NORM
 
 DEFAULT_MODEL = "checkpoints/overnight_v1/best_model/best_model.zip"
 BEAMNG_HOME = r"C:\BeamNG\BeamNG.tech.v0.38.5.0"
@@ -126,7 +127,17 @@ def _readout(obs, action):
     else:
         pedal = f"BRAKE[{_fill_bar(-thr)}]{-thr * 100:3.0f}%"
     does = f" DOES  steer[{_center_bar(steer)}]{steer_word:8s}   {pedal}"
-    return [sees, road, does]
+    lines = [sees, road, does]
+    # run27 drift: with the 20-dim drift obs, show the LIVE slide angle vs the target it is being
+    # asked to hold right now. obs[17]=beta/45 (the actual slide), obs[19]=beta_target/norm (the goal).
+    if len(obs) >= 20:
+        slide = float(obs[17]) * 45.0
+        target = float(obs[19]) * BETA_TARGET_OBS_NORM
+        gap = slide - target
+        lines.append(f"DRIFT  slide[{_fill_bar(slide / 45.0)}]{slide:3.0f}°"
+                     f"   target {target:3.0f}°   {'+' if gap >= 0 else ''}{gap:.0f}° "
+                     f"{'OVER' if gap > 3 else ('under' if gap < -3 else 'on target')}")
+    return lines
 
 
 def _reward_lines(progress, cp_bonus, speed, smooth, step_total, score, cp, banner):
