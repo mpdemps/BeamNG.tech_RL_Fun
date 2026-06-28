@@ -298,19 +298,50 @@ def _deploy_drift_pc(home: Optional[str] = None) -> str:
     """Copy the repo's data/gts_drift.pc into the BeamNG userfolder vehicles dir so BeamNG can
     resolve VEHICLE_PART_CONFIG_DRIFT ('vehicles/scintilla/gts_drift.pc') from its VFS. Returns the
     destination path. Idempotent. Raises if the userfolder can't be found (so a drift run fails
-    loudly rather than silently spawning the wrong car)."""
+    loudly rather than silently spawning the wrong car).
+
+    Cross-platform: BeamNG mounts a userfolder VERSION dir (.../<version|current>/) over the game
+    content, and we deploy under that dir's vehicles/. The location differs by OS:
+      - $BEAMNG_USERFOLDER (any platform): explicit override -- either a version dir, or a parent
+        holding 'current'/<version> subdirs. Use this if auto-detect misses.
+      - Windows: %LOCALAPPDATA%\\BeamNG.drive\\<version> or %LOCALAPPDATA%\\BeamNG.tech\\<version>.
+      - Linux (the mini): ~/.local/share/BeamNG*/BeamNG.tech/<current|version>.
+    """
     import os, glob, shutil
     src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "data", "gts_drift.pc")
     if not os.path.isfile(src):
         raise FileNotFoundError(f"drift .pc not in repo: {src}")
-    # BeamNGpy is launched with user=None, so BeamNG uses its default userfolder. Find the
-    # version dir that the VFS mounts ('.../BeamNG.tech/<ver|current>/'); deploy under vehicles/.
-    roots = sorted(glob.glob(os.path.expanduser("~/.local/share/BeamNG*/BeamNG.tech/current"))
-                   + glob.glob(os.path.expanduser("~/.local/share/BeamNG*/BeamNG.tech/0.*")))
-    if not roots:
-        raise FileNotFoundError("BeamNG userfolder not found under ~/.local/share/BeamNG*/BeamNG.tech")
-    dst_dir = os.path.join(roots[-1], "vehicles", "scintilla")
+
+    def _verdirs(base):  # the 'current' + numeric-version subdirs under a userfolder base
+        return glob.glob(os.path.join(base, "current")) + glob.glob(os.path.join(base, "0.*"))
+
+    override = os.environ.get("BEAMNG_USERFOLDER")
+    if override:
+        subs = sorted(d for d in _verdirs(override) if os.path.isdir(d))
+        if subs:
+            verdir = subs[-1]
+        elif os.path.isdir(override):
+            verdir = override            # BEAMNG_USERFOLDER points straight at the version dir
+        else:
+            raise FileNotFoundError(f"BEAMNG_USERFOLDER does not exist: {override}")
+    else:
+        if os.name == "nt":
+            local = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
+            bases = [os.path.join(local, "BeamNG.drive"), os.path.join(local, "BeamNG.tech")]
+            patterns = [p for b in bases for p in _verdirs(b)]
+        else:
+            patterns = [os.path.expanduser("~/.local/share/BeamNG*/BeamNG.tech/current"),
+                        os.path.expanduser("~/.local/share/BeamNG*/BeamNG.tech/0.*")]
+        dirs = sorted(d for pat in patterns for d in glob.glob(pat) if os.path.isdir(d))
+        if not dirs:
+            raise FileNotFoundError(
+                "BeamNG userfolder not found. Set BEAMNG_USERFOLDER to the BeamNG.tech userfolder "
+                "(the dir containing 'current'/<version>, e.g. %LOCALAPPDATA%\\BeamNG.drive). "
+                f"Searched: {patterns}")
+        verdir = dirs[-1]                # prefer 'current', else the highest version (sorts last)
+
+    dst_dir = os.path.join(verdir, "vehicles", "scintilla")
     os.makedirs(dst_dir, exist_ok=True)
     dst = os.path.join(dst_dir, "gts_drift.pc")
     shutil.copyfile(src, dst)
