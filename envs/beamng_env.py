@@ -404,9 +404,15 @@ OVER_SPEED_OFFSET = 0.0  # m/s; start the over-speed penalty this far BELOW v_ta
 # Both are gated by forward velocity-alignment. MIKEY OWNS THIS BALANCE -- these are starting
 # defaults he shapes at review (drift showy vs keep moving).
 W_DRIFT = 1.0           # weight on the slip-angle match bump (peaks when |beta| == beta_target)
-W_DRIFT_PROGRESS = 0.3  # weight on forward progress in drift mode (vs W_PROG=1.0 for the grip lap):
-                        # lower so the agent isn't paid to just drive fast & straight, but nonzero
-                        # so a drift that stops going anywhere (donut-in-place) is not the optimum.
+W_DRIFT_PROGRESS = 0.6  # run28 (Mikey): raised 0.3 -> 0.6 to push the policy to CATCH/control the
+                        # slide and keep moving cleanly forward (fixes run27's over-speed-wash-off-T1).
+                        # W_DRIFT stays 1.0. PROPOSED -- Mikey sets the final value at review.
+# run28 (Mikey): backward-motion penalty. The run27 watch saw a reverse flail -- the car ending up
+# travelling BACKWARD along the track. Penalize negative forward-velocity (the velocity component
+# along the line) so reverse costs, proportional to how fast it's going backward. SAFE FOR DRIFT: a
+# real forward slide keeps forward-velocity POSITIVE even at high slip (the car still travels down-
+# track while pointed sideways), so this fires ONLY on actual reverse, never on a forward drift.
+W_DRIFT_BACKWARD = 0.5  # penalty per m/s of backward (along-track) speed. PROPOSED -- review knob.
 # run27 (Mikey): the drift-match reward is gated to CORNERS only. Where the smoothed racing-line
 # curvature |kappa| exceeds this, the car is rewarded for drifting; on straights (below it) the
 # drift term is 0 and the normal grip progress/speed reward applies (drive straight, fast). ~1/85 m
@@ -583,6 +589,8 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._drift_sum = 0.0        # run27: per-episode sum of the drift-match bonus (drift_mode)
         self._drift_corner_steps = 0 # run27: steps spent in a corner (where the drift reward is live)
         self._beta_err_sum = 0.0     # run27: sum of |beta - beta_target| over those steps (drift card)
+        self._backward_pen_sum = 0.0 # run28: per-episode sum of the backward-motion penalty
+        self._backward_vel_steps = 0 # run28: steps travelling backward (along-track vel < 0) -> frac
         self._over_speed_sum = 0.0   # run16 telemetry: sum of max(0, v - v_target) per step
         self._over_speed_steps = 0   # run18 telemetry: count of steps over v_target
         self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
@@ -750,6 +758,8 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._drift_sum = 0.0        # run27: per-episode sum of the drift-match bonus (drift_mode)
         self._drift_corner_steps = 0 # run27: steps spent in a corner (where the drift reward is live)
         self._beta_err_sum = 0.0     # run27: sum of |beta - beta_target| over those steps (drift card)
+        self._backward_pen_sum = 0.0 # run28: per-episode sum of the backward-motion penalty
+        self._backward_vel_steps = 0 # run28: steps travelling backward (along-track vel < 0) -> frac
         self._over_speed_sum = 0.0   # run16 telemetry: sum of max(0, v - v_target) per step
         self._over_speed_steps = 0   # run18 telemetry: count of steps over v_target
         self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
@@ -843,6 +853,8 @@ class BeamNGRaceEnv(gymnasium.Env):
             "r_drift": float(self._drift_sum),
             "beta_err_mean": float(self._beta_err_sum / max(self._drift_corner_steps, 1)),
             "drift_corner_steps": int(self._drift_corner_steps),
+            "r_backward": float(self._backward_pen_sum),
+            "backward_frac": float(self._backward_vel_steps / max(self._ep_steps, 1)),
             "over_speed_mean": float(self._over_speed_sum / max(self._ep_steps, 1)),
             "over_speed_frac": float(self._over_speed_steps / max(self._ep_steps, 1)),
             "v_target_here": float(V_TARGET_PROFILE[self._progress_idx]),
@@ -1126,19 +1138,20 @@ class BeamNGRaceEnv(gymnasium.Env):
 
         if self.drift_mode and is_corner:
             # DRIFT reward: reward holding |beta| at the speed-scaled beta_target (the 0..1 match
-            # bump), plus a SMALL forward-progress term so the car keeps covering ground rather than
-            # spinning in place. Both gated by forward velocity-alignment (a backward or parked spin
-            # earns nothing). The grip-lap terms (over-speed brake signal, anti-timid match, and
-            # crucially the slip PENALTY that fights drift) are all OFF in a corner. Mikey tunes the
-            # W_DRIFT/W_DRIFT_PROGRESS balance at review.
+            # bump), plus the (run28-raised) forward-progress term so the car keeps moving forward.
+            # Both gated by forward velocity-alignment (a backward or parked spin earns nothing).
+            # The slip PENALTY (which fights drift) and the anti-timid speed MATCH stay OFF in a
+            # corner. run28 (Mikey) change #3: the over-speed brake signal is RE-ACTIVATED here (it
+            # was dropped in run27) so the car still slows to the corner's v_target before drifting --
+            # fixing run27's over-speed-into-T1. Mikey tunes the W_DRIFT/W_DRIFT_PROGRESS balance.
             bt = _beta_target(speed_horizontal)
             drift_bonus = W_DRIFT * _drift_reward(self._last_beta, bt) * gated_alignment
             final_reward = W_DRIFT_PROGRESS * raw_progress * gated_alignment
-            over_speed_penalty = 0.0
+            v_target = float(V_TARGET_PROFILE[self._progress_idx])
+            over = max(0.0, speed_horizontal - (v_target - OVER_SPEED_OFFSET))
+            over_speed_penalty = -W_OVER * over * over    # RE-ACTIVATED: brake to corner target first
             match_reward = 0.0
             slip_penalty = 0.0
-            v_target = float(V_TARGET_PROFILE[self._progress_idx])  # telemetry parity only
-            over = 0.0
             self._drift_sum += drift_bonus
             self._drift_corner_steps += 1                 # drift card: how much drifting was scored
             self._beta_err_sum += abs(self._last_beta - bt)  # and how close to the target angle
@@ -1167,6 +1180,19 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._over_speed_sum += over
         if over > 0.01:
             self._over_speed_steps += 1
+
+        # run28 (Mikey) backward-motion penalty (drift_mode): forward-velocity = the along-track
+        # component (speed * cos to the tangent). When it is NEGATIVE the car is actually travelling
+        # backward -> penalize proportional to the backward speed. SAFE FOR DRIFT: a forward slide has
+        # positive forward-velocity (down-track) even at high slip, so this is 0 during a real drift
+        # and only bites on reverse. (The 40-step nose-backward terminator is kept as well.)
+        backward_pen = 0.0
+        if self.drift_mode:
+            fwd_vel = speed_horizontal * raw_alignment        # signed along-track speed (m/s)
+            if fwd_vel < 0.0:
+                backward_pen = -W_DRIFT_BACKWARD * (-fwd_vel)
+                self._backward_vel_steps += 1                 # reverse telemetry: backward-fraction
+            self._backward_pen_sum += backward_pen
 
         # logging-only: per-episode sums of each reward term so TB can show real progress
         # apart from the match term ("paid to crawl"). Behavior-neutral.
@@ -1210,9 +1236,10 @@ class BeamNGRaceEnv(gymnasium.Env):
                 checkpoint_bonus += CHECKPOINT_BONUS
         # run16 total: progress + checkpoints − over-speed − slip-angle. The over-speed
         # term is the brake signal; progress rewards covering ground at/below v_target.
-        # run27 drift_mode: drift_bonus is the slip-angle MATCH; the grip terms above are 0.
+        # run27 drift_mode: drift_bonus is the slip-angle MATCH (slip penalty/match off in corners).
+        # run28 drift_mode: + backward_pen (penalize travelling in reverse).
         return float(final_reward + checkpoint_bonus + over_speed_penalty + slip_penalty
-                     + match_reward + drift_bonus)
+                     + match_reward + drift_bonus + backward_pen)
 
     def _check_done(self) -> Tuple[bool, float]:
         """Did the episode end? If so, what bonus or penalty applies?
