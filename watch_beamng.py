@@ -212,6 +212,10 @@ def main():
     parser.add_argument("--residual-throttle-up", type=float, default=None,
                         help="run24: cap the positive throttle residual (e.g. 0.05); must match the "
                              "trained run. None = symmetric (run22/23).")
+    parser.add_argument("--drift", action="store_true",
+                        help="run27 Phase 2: watch a DRIFT policy -- builds the GTS drift car + the "
+                             "20-dim drift obs so the saved drift model loads and drives. Required for "
+                             "run27 checkpoints (else the 19-dim env shape-mismatches the policy).")
     args = parser.parse_args()
     _enable_ansi()   # so the live panel can redraw in place (Windows-safe)
 
@@ -230,7 +234,10 @@ def main():
     print("Loading model and launching BeamNG (silent for ~60s)...")
 
     # Visible window. No headless, no nogpu. We want to watch.
-    env = make_beamng_env(home=BEAMNG_HOME, launch=True, headless=False, nogpu=False, random_spawn=False)
+    env = make_beamng_env(home=BEAMNG_HOME, launch=True, headless=False, nogpu=False,
+                          random_spawn=False, drift_mode=args.drift)
+    if args.drift:
+        print("DRIFT MODE: GTS drift car (drift mode + LSD diff), 20-dim drift obs.")
     # run22: wrap so the watched car drives the FULL hybrid (controller + clipped residual),
     # exactly as training does -- the model is just the residual policy. Without this the bare
     # policy (a small +/-delta trim) would drive alone and go nowhere.
