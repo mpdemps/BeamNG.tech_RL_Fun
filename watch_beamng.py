@@ -10,10 +10,13 @@ Usage:
 """
 
 import argparse
+import math
 import os
 import signal
 import subprocess
 import sys
+
+import numpy as np
 
 # Match train_beamng.py behavior: kill any lingering BeamNG before launching.
 for proc in ("BeamNG.tech.exe", "support.exe"):
@@ -25,7 +28,13 @@ from envs.beamng_env import (
     MAX_LOOKAHEAD_DIST_M, LOOKAHEAD_DISTANCES_M,
     N_CHECKPOINTS, CHECKPOINT_BONUS, LAP_BONUS)
 from envs.residual_hybrid import ResidualHybrid
+from envs.base_controller import BaseController
 from envs.drift import BETA_TARGET_OBS_NORM
+
+# run30 --rolling-start: mid-track straight to launch from (the car spends a few
+# seconds gripping up to speed here, then the policy takes over into the next corner).
+ROLLING_START_IDX = 561      # mid back-straight, aligned (same spot the probes used)
+ROLLING_START_SPEED = 18.0   # m/s to reach before handing over to the policy
 
 DEFAULT_MODEL = "checkpoints/overnight_v1/best_model/best_model.zip"
 BEAMNG_HOME = r"C:\BeamNG\BeamNG.tech.v0.38.5.0"
@@ -227,6 +236,14 @@ def main():
                         help="run27 Phase 2: watch a DRIFT policy -- builds the GTS drift car + the "
                              "20-dim drift obs so the saved drift model loads and drives. Required for "
                              "run27 checkpoints (else the 19-dim env shape-mismatches the policy).")
+    parser.add_argument("--rolling-start", action="store_true",
+                        help="run30: start the car mid-track ALREADY AT SPEED instead of from the "
+                             "standstill start line -- the base controller grips it up to speed on a "
+                             "straight, then hands over to the policy. Lets you watch the DRIFT skill "
+                             "by itself, separate from the standstill launch off the line.")
+    parser.add_argument("--rolling-speed", type=float, default=ROLLING_START_SPEED,
+                        help="run30: target speed (m/s) the controller reaches before handing to the "
+                             "policy in --rolling-start.")
     args = parser.parse_args()
     _enable_ansi()   # so the live panel can redraw in place (Windows-safe)
 
@@ -280,12 +297,31 @@ def main():
     print()
 
     try:
-        reset_kwargs = ({"options": {"spawn_idx": args.spawn_idx}}
-                        if args.spawn_idx is not None else {})
+        # run30 --rolling-start overrides the spawn to a mid-track straight; --spawn-idx still wins
+        # if given explicitly.
+        if args.spawn_idx is not None:
+            reset_kwargs = {"options": {"spawn_idx": args.spawn_idx}}
+        elif args.rolling_start:
+            reset_kwargs = {"options": {"spawn_idx": ROLLING_START_IDX}}
+        else:
+            reset_kwargs = {}
         for ep in range(args.episodes):
             obs, info = env.reset(**reset_kwargs)
             if ep == 0:
                 _report_active_config()   # confirm race vs gts by read-back, once
+            if args.rolling_start:
+                # Grip up to speed with the base controller, THEN hand to the policy. set_velocity is
+                # a no-op in this BeamNG build, so we drive it up rather than teleport-to-speed.
+                rc = BaseController(); rc.reset(); rc._idx = ROLLING_START_IDX
+                for _ in range(300):
+                    s = _shared["vehicle"].sensors["agent_state"]; vel = s["vel"]
+                    sp = math.hypot(vel[0], vel[1])
+                    st, th = rc.action(s["pos"], vel, s.get("dir", (1.0, 0.0, 0.0)))
+                    obs, _, term, trunc, info = env.step(np.array([st, max(th, 0.6)], np.float32))
+                    if sp >= args.rolling_speed or term or trunc:
+                        break
+                print(f"ROLLING START: controller reached {sp:.0f} m/s at mid-track (idx "
+                      f"{ROLLING_START_IDX}); handing to the policy.", flush=True)
             ep_reward = 0.0
             ep_steps = 0
             prev_cp = 0           # checkpoints reached as of last step
