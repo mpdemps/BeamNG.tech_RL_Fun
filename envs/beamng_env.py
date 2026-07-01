@@ -413,6 +413,12 @@ W_DRIFT_PROGRESS = 0.6  # run28 (Mikey): raised 0.3 -> 0.6 to push the policy to
 # real forward slide keeps forward-velocity POSITIVE even at high slip (the car still travels down-
 # track while pointed sideways), so this fires ONLY on actual reverse, never on a forward drift.
 W_DRIFT_BACKWARD = 0.5  # penalty per m/s of backward (along-track) speed. PROPOSED -- review knob.
+# run30 (Mikey): the run29 straight slip penalty (W_SLIP 0.05) was FAR too weak -- start-line eval
+# never reached T1 (0/34, died ~50m in fishtailing the opening straight; the car ate the tiny penalty
+# and slid anyway). Raise it substantially so GRIPPING the straight clearly beats sliding. DEDICATED
+# constant (NOT the shared W_SLIP) so Phase 1's grip-lap slip penalty stays at 0.05, unchanged. Still
+# gated to straights by (1-cf) so it rings OFF at corner entry -- a turn-in drift can still initiate.
+W_DRIFT_STRAIGHT_SLIP = 0.2  # deg-penalty weight for sliding on a straight (drift_mode). PROPOSED -- review knob.
 # run27 (Mikey): the drift-match reward is gated to CORNERS only. Where the smoothed racing-line
 # curvature |kappa| exceeds this, the car is rewarded for drifting; on straights (below it) the
 # drift term is 0 and the normal grip progress/speed reward applies (drive straight, fast). ~1/85 m
@@ -1149,9 +1155,11 @@ class BeamNGRaceEnv(gymnasium.Env):
             final_reward = ((1.0 - cf) * W_PROG + cf * W_DRIFT_PROGRESS) * raw_progress * gated_alignment
             over_speed_penalty = -W_OVER * over * over        # corner brake discipline (run28), always on
             match_reward = (1.0 - cf) * W_MATCH * min(speed_horizontal, v_target) * gated_alignment
-            # STRAIGHT slip penalty (run29 #2): penalize |beta| on straights, RAMP OFF into the corner
-            # (mirror of the drift reward) so turn-in drifts aren't punished. Reuses W_SLIP/deadzone.
-            slip_penalty = -(1.0 - cf) * W_SLIP * max(0.0, self._last_beta - BETA_SLIP_DEAD)
+            # STRAIGHT slip penalty (run29 #2, run30 STRENGTHENED): penalize |beta| on straights,
+            # RAMP OFF into the corner (mirror of the drift reward) so turn-in drifts aren't punished.
+            # run30: uses the dedicated W_DRIFT_STRAIGHT_SLIP (0.2, up from run29's W_SLIP 0.05) so
+            # gripping the opening straight clearly beats sliding. Same deadzone (BETA_SLIP_DEAD).
+            slip_penalty = -(1.0 - cf) * W_DRIFT_STRAIGHT_SLIP * max(0.0, self._last_beta - BETA_SLIP_DEAD)
             # DRIFT match (run27), ramped ON by cf: reward holding |beta| at the (gated) target
             drift_bonus = cf * W_DRIFT * _drift_reward(self._last_beta, bt) * gated_alignment
             self._drift_sum += drift_bonus
