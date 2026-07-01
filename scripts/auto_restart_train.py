@@ -85,10 +85,14 @@ def freeze_onset_step(run):
 
 
 def last_clean_checkpoint(run, onset):
-    """Highest rolling_<N>_steps.zip with N strictly below the freeze onset."""
+    """Highest <prefix>_<N>_steps.zip with N strictly below the freeze onset.
+
+    run31: the checkpoint prefix changed from "rolling" to the run name (globally unique files
+    for Taildrop), so match ANY *_<N>_steps.zip. Milestone files ("..._stepNNN.zip") and
+    best_model/final don't match the _<N>_steps suffix, so only rolling checkpoints qualify."""
     best = None
-    for p in glob.glob(f"{ckpt_dir(run)}/rolling_*_steps.zip"):
-        m = re.search(r"rolling_(\d+)_steps", p)
+    for p in glob.glob(f"{ckpt_dir(run)}/*_steps.zip"):
+        m = re.search(r"_(\d+)_steps", p)
         if not m:
             continue
         n = int(m.group(1))

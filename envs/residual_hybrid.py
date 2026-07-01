@@ -57,6 +57,7 @@ class ResidualHybrid(gymnasium.Wrapper):
         self._thr_sum = 0.0
         self._thr_pos_sum = 0.0     # run24: sum of POSITIVE throttle residual (gas the policy adds)
         self._thr_sat_n = 0         # run24: steps the +throttle residual is AT the +cap (saturating)
+        self._cf_sum = 0.0          # run31: episode sum of corner_factor (per-ep mean -> telemetry)
         self._res_n = 0
         self.last_applied = None      # watcher display: the controller+residual action actually sent
         self.last_residual = None     # watcher display: the clipped residual the policy added
@@ -67,6 +68,7 @@ class ResidualHybrid(gymnasium.Wrapper):
         self._thr_sum = 0.0
         self._thr_pos_sum = 0.0
         self._thr_sat_n = 0
+        self._cf_sum = 0.0
         self._res_n = 0
         return self.env.reset(**kwargs)
 
@@ -98,7 +100,9 @@ class ResidualHybrid(gymnasium.Wrapper):
         applied = np.clip(ctrl + clipped, -1.0, 1.0)                 # controller (relaxed brake) + residual
         self.last_applied, self.last_residual = applied, clipped
         obs, reward, terminated, truncated, info = self.env.step(applied)
+        self._cf_sum += float(cf)
         info["residual_cf"] = float(cf)   # run31: corner-gate factor this step (0 straight .. 1 corner)
+        info["residual_cf_mean"] = self._cf_sum / max(self._res_n + 1, 1)  # per-ep mean (telemetry)
         # track mean |applied residual| per channel over the episode (how hard the RL pushes each)
         self._steer_sum += abs(float(clipped[0]))
         self._thr_sum += abs(float(clipped[1]))
