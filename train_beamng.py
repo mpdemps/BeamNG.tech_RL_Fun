@@ -288,8 +288,12 @@ def main():
         steer_rate=args.steer_rate, drift_mode=args.drift,
     )
     if args.residual:
+        # run31: --residual + --drift => the controller-backed drift hybrid, with corner-gated
+        # residual authority (tight straights / big corners) + corner brake-relax. Plain --residual
+        # (no --drift) keeps the run22-24 fixed-bound behavior.
         _train_core = ResidualHybrid(_train_core, delta=args.residual_delta,
-                                     throttle_up=args.residual_throttle_up)
+                                     throttle_up=args.residual_throttle_up,
+                                     corner_gated=args.drift)
     train_env = Monitor(
         _train_core,
         filename=str(log_dir / "train"),
@@ -305,7 +309,8 @@ def main():
     )
     if args.residual:
         eval_env = ResidualHybrid(eval_env, delta=args.residual_delta,
-                                  throttle_up=args.residual_throttle_up)
+                                  throttle_up=args.residual_throttle_up,
+                                  corner_gated=args.drift)
 
     # SAC with SB3 sensible defaults for continuous control. buffer_size 1M holds
     # the whole 500k run; ent_coef "auto" self-tunes exploration. learning_rate

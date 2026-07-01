@@ -1134,7 +1134,18 @@ class BeamNGRaceEnv(gymnasium.Env):
             self._max_slip = max(self._max_slip, self._last_slip)
             self._last_spin_penalty = 0.0
             self._steps_since_progress += 1
-            return 0.0
+            # run31 heading-gap fix: the backward-motion penalty used to sit AFTER this early-return,
+            # so a nose-backward wall-pin (heading_align < -0.2) that is also rolling backward escaped
+            # it (free 0.0). Accrue + RETURN it here too (drift_mode) so reverse is punished regardless
+            # of nose direction. Mutually exclusive with the normal-path block below (one runs per step).
+            kill_backward_pen = 0.0
+            if self.drift_mode:
+                fwd_vel = speed_horizontal * raw_alignment
+                if fwd_vel < 0.0:
+                    kill_backward_pen = -W_DRIFT_BACKWARD * (-fwd_vel)
+                    self._backward_vel_steps += 1
+                self._backward_pen_sum += kill_backward_pen
+            return float(kill_backward_pen)
 
         # Gate: clamp negative to zero so backward driving earns no reward.
         gated_alignment = max(0.0, raw_alignment)
