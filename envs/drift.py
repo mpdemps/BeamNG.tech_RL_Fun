@@ -33,6 +33,28 @@ import math
 SPIN_BETA_DEG = 60.0          # deg; |beta| past this = lost it (the terminator fires; probe measured
                               # a real spin pegging beta ~180 deg, vs a target band <= ~20 deg here)
 
+# --- corner_factor(kappa): the smooth straight<->corner ramp (run29) ---
+# run28 corner-gated the drift REWARD with a HARD boolean (|kappa| > DRIFT_CORNER_KAPPA), but left
+# the TARGET speed-based everywhere -- so on the fast straight beta_target read ~12 deg and the car
+# fishtailed the straight chasing it. run29 gates the target too AND penalizes straight slides,
+# using this CONTINUOUS ramp so the transition is smooth: as the car enters a turn the target ramps
+# UP and the straight slip-penalty ramps OFF together (no discontinuity that would block a turn-in
+# drift or leave a straight slide unpunished). 0 on straights, 1 in corners; the old hard gate
+# (0.012) sits mid-ramp.
+CORNER_KAPPA_LO = 0.006   # 1/m; |kappa| at/below this = pure straight  (corner_factor 0)
+CORNER_KAPPA_HI = 0.018   # 1/m; |kappa| at/above this = full corner    (corner_factor 1)
+
+
+def corner_factor(kappa_abs: float) -> float:
+    """0..1 'corner-ness' of the racing line here: 0 on a straight, 1 in a corner, linear ramp
+    between (the transition zone at corner entry). Same curvature signal the drift reward gates on."""
+    if kappa_abs <= CORNER_KAPPA_LO:
+        return 0.0
+    if kappa_abs >= CORNER_KAPPA_HI:
+        return 1.0
+    return (kappa_abs - CORNER_KAPPA_LO) / (CORNER_KAPPA_HI - CORNER_KAPPA_LO)
+
+
 # --- beta_target(speed): speed-scaled target slip angle (degrees) ---
 # Base band at DRIFT_SCALE=1.0 is Mikey's small starting target; raising DRIFT_SCALE later (warm
 # start) lifts the whole band toward big showy drifts.

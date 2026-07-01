@@ -290,8 +290,8 @@ from data.raceline_builtin import RACELINE
 from envs.speed_profile import compute_speed_profile, V_MAX as PROFILE_V_MAX
 # run27 Phase 2 drift scaffolding (pure functions; only used when drift_mode=True).
 from envs.drift import (beta_target as _beta_target, drift_reward as _drift_reward,
-                        is_drift_spin as _is_drift_spin, BETA_TARGET_OBS_NORM,
-                        DRIFT_SPIN_STEPS, DRIFT_NO_PROGRESS_STEPS)
+                        is_drift_spin as _is_drift_spin, corner_factor as _corner_factor,
+                        BETA_TARGET_OBS_NORM, DRIFT_SPIN_STEPS, DRIFT_NO_PROGRESS_STEPS)
 
 
 def _deploy_drift_pc(home: Optional[str] = None) -> str:
@@ -591,6 +591,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._beta_err_sum = 0.0     # run27: sum of |beta - beta_target| over those steps (drift card)
         self._backward_pen_sum = 0.0 # run28: per-episode sum of the backward-motion penalty
         self._backward_vel_steps = 0 # run28: steps travelling backward (along-track vel < 0) -> frac
+        self._straight_slip_steps = 0 # run29: steps the straight slip-penalty bit (sliding off-corner)
         self._over_speed_sum = 0.0   # run16 telemetry: sum of max(0, v - v_target) per step
         self._over_speed_steps = 0   # run18 telemetry: count of steps over v_target
         self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
@@ -760,6 +761,7 @@ class BeamNGRaceEnv(gymnasium.Env):
         self._beta_err_sum = 0.0     # run27: sum of |beta - beta_target| over those steps (drift card)
         self._backward_pen_sum = 0.0 # run28: per-episode sum of the backward-motion penalty
         self._backward_vel_steps = 0 # run28: steps travelling backward (along-track vel < 0) -> frac
+        self._straight_slip_steps = 0 # run29: steps the straight slip-penalty bit (sliding off-corner)
         self._over_speed_sum = 0.0   # run16 telemetry: sum of max(0, v - v_target) per step
         self._over_speed_steps = 0   # run18 telemetry: count of steps over v_target
         self._steer_stream = []      # run12 logging: per-episode applied steer/throttle
@@ -855,6 +857,7 @@ class BeamNGRaceEnv(gymnasium.Env):
             "drift_corner_steps": int(self._drift_corner_steps),
             "r_backward": float(self._backward_pen_sum),
             "backward_frac": float(self._backward_vel_steps / max(self._ep_steps, 1)),
+            "straight_slip_frac": float(self._straight_slip_steps / max(self._ep_steps, 1)),
             "over_speed_mean": float(self._over_speed_sum / max(self._ep_steps, 1)),
             "over_speed_frac": float(self._over_speed_steps / max(self._ep_steps, 1)),
             "v_target_here": float(V_TARGET_PROFILE[self._progress_idx]),
@@ -986,13 +989,13 @@ class BeamNGRaceEnv(gymnasium.Env):
         # threshold -> 0.0 on the road, ramping to 1.0 at the edge (clipped). Lets the policy SEE
         # it is running wide toward low-grip grass and rein the throttle in BEFORE off_track fires.
         vals.append(float(np.clip(_dist_to_road(pos[0], pos[1]) / OFF_TRACK_THRESHOLD_M, 0.0, 1.0)))
-        # [19] run27 DRIFT target slip angle at the current speed. Only present in drift_mode -> the
-        # policy sees the angle it is being asked to hold RIGHT NOW (alongside beta=obs[17] and
-        # speed=obs[0]). Normalized by BETA_TARGET_OBS_NORM (the BIG-regime max, ~40 deg), NOT the
-        # small starting target, so a later warm-start that raises DRIFT_SCALE grows this obs value
-        # consistently instead of re-scaling under the policy.
+        # [19] run27/29 DRIFT target slip angle. run29: CORNER-GATED by corner_factor -> ~0 on a
+        # straight, ramping to the speed-scaled band in a corner, so the policy no longer sees a
+        # "slide 12 deg" target on the fast straight (the run28 straight-fishtail cause). Normalized
+        # by BETA_TARGET_OBS_NORM (the BIG-regime max) so a later DRIFT_SCALE raise reads consistently.
         if self.drift_mode:
-            vals.append(float(np.clip(_beta_target(speed) / BETA_TARGET_OBS_NORM, -1.0, 1.0)))
+            cf = _corner_factor(abs(float(_PROFILE_KAPPA[idx])))
+            vals.append(float(np.clip(cf * _beta_target(speed) / BETA_TARGET_OBS_NORM, -1.0, 1.0)))
         obs = np.array(vals, dtype=np.float32)
         return np.clip(obs, -1.0, 1.0)
 
@@ -1129,53 +1132,45 @@ class BeamNGRaceEnv(gymnasium.Env):
 
         # Gate: clamp negative to zero so backward driving earns no reward.
         gated_alignment = max(0.0, raw_alignment)
+        # v_target + over-speed amount, used by both regimes below.
+        v_target = float(V_TARGET_PROFILE[self._progress_idx])
+        over = max(0.0, speed_horizontal - (v_target - OVER_SPEED_OFFSET))
 
-        # run27 (Mikey): the drift-match reward is active only in CORNERS (curvature above
-        # threshold). On straights the car reverts to the grip progress/speed reward (drive straight,
-        # fast); in corners it is rewarded for drifting. So it learns to drift AROUND corners, not
-        # everywhere. (Forward-progress gating via gated_alignment applies in both -> no spin-in-place.)
-        is_corner = abs(float(_PROFILE_KAPPA[self._progress_idx])) > DRIFT_CORNER_KAPPA
-
-        if self.drift_mode and is_corner:
-            # DRIFT reward: reward holding |beta| at the speed-scaled beta_target (the 0..1 match
-            # bump), plus the (run28-raised) forward-progress term so the car keeps moving forward.
-            # Both gated by forward velocity-alignment (a backward or parked spin earns nothing).
-            # The slip PENALTY (which fights drift) and the anti-timid speed MATCH stay OFF in a
-            # corner. run28 (Mikey) change #3: the over-speed brake signal is RE-ACTIVATED here (it
-            # was dropped in run27) so the car still slows to the corner's v_target before drifting --
-            # fixing run27's over-speed-into-T1. Mikey tunes the W_DRIFT/W_DRIFT_PROGRESS balance.
-            bt = _beta_target(speed_horizontal)
-            drift_bonus = W_DRIFT * _drift_reward(self._last_beta, bt) * gated_alignment
-            final_reward = W_DRIFT_PROGRESS * raw_progress * gated_alignment
-            v_target = float(V_TARGET_PROFILE[self._progress_idx])
-            over = max(0.0, speed_horizontal - (v_target - OVER_SPEED_OFFSET))
-            over_speed_penalty = -W_OVER * over * over    # RE-ACTIVATED: brake to corner target first
-            match_reward = 0.0
-            slip_penalty = 0.0
+        if self.drift_mode:
+            # run29 (Mikey): GRIP the straights, DRIFT the corners -- via a smooth corner_factor cf
+            # (0 straight .. 1 corner) instead of run28's hard boolean, so the transition at turn-in
+            # is continuous. The endpoints reproduce run28 exactly: cf=0 == the grip reward below,
+            # cf=1 == run28's corner-drift reward. In between they crossfade, so as the car enters a
+            # turn the TARGET ramps up and the STRAIGHT SLIP PENALTY ramps off together (a drift can
+            # initiate cleanly, and a straight slide is still punished).
+            cf = _corner_factor(abs(float(_PROFILE_KAPPA[self._progress_idx])))
+            bt = cf * _beta_target(speed_horizontal)          # corner-gated target: 0 straight, band corner
+            # progress weight crossfades W_PROG(straight) -> W_DRIFT_PROGRESS(corner)
+            final_reward = ((1.0 - cf) * W_PROG + cf * W_DRIFT_PROGRESS) * raw_progress * gated_alignment
+            over_speed_penalty = -W_OVER * over * over        # corner brake discipline (run28), always on
+            match_reward = (1.0 - cf) * W_MATCH * min(speed_horizontal, v_target) * gated_alignment
+            # STRAIGHT slip penalty (run29 #2): penalize |beta| on straights, RAMP OFF into the corner
+            # (mirror of the drift reward) so turn-in drifts aren't punished. Reuses W_SLIP/deadzone.
+            slip_penalty = -(1.0 - cf) * W_SLIP * max(0.0, self._last_beta - BETA_SLIP_DEAD)
+            # DRIFT match (run27), ramped ON by cf: reward holding |beta| at the (gated) target
+            drift_bonus = cf * W_DRIFT * _drift_reward(self._last_beta, bt) * gated_alignment
             self._drift_sum += drift_bonus
-            self._drift_corner_steps += 1                 # drift card: how much drifting was scored
-            self._beta_err_sum += abs(self._last_beta - bt)  # and how close to the target angle
+            if cf > 0.5:                                      # drift card: steps where the drift is scored
+                self._drift_corner_steps += 1
+                self._beta_err_sum += abs(self._last_beta - bt)
+            if slip_penalty < -1e-9:                          # run29 straight-slip telemetry
+                self._straight_slip_steps += 1
         else:
             drift_bonus = 0.0
             # run16: progress is the cover-the-track core (kept). The speed-EVERYWHERE term,
             # the steering/throttle smoothness penalties, and the wheelspin spin_penalty are
             # all DROPPED -- braking/cornering are LEARNED via the two terms below.
             final_reward = W_PROG * raw_progress * gated_alignment
-
-            # THE BRAKE SIGNAL: penalize exceeding the braking-aware target speed at the car's
-            # position (squared: gentle near target, sharp when hot). OVER_SPEED_OFFSET shifts
-            # the knee below v_target so the gradient is nonzero AT target (calibration knob).
-            v_target = float(V_TARGET_PROFILE[self._progress_idx])
-            over = max(0.0, speed_horizontal - (v_target - OVER_SPEED_OFFSET))
+            # THE BRAKE SIGNAL: penalize exceeding the braking-aware target speed (squared).
             over_speed_penalty = -W_OVER * over * over
-
-            # run18 anti-timid nudge: reward carrying speed UP TO the target (capped at
-            # v_target so it adds no incentive to exceed it; alignment-gated so off-line
-            # speed earns nothing). This is what breaks the timid crawl.
+            # run18 anti-timid nudge: reward carrying speed UP TO the target (capped, alignment-gated).
             match_reward = W_MATCH * min(speed_horizontal, v_target) * gated_alignment
-
-            # Slip-angle penalty (replaces ESC + the wheelspin spin_penalty): a reward signal
-            # to not slide, so the policy LEARNS grip instead of having throttle cut. beta deg.
+            # Slip-angle penalty: a reward signal to not slide, so the policy LEARNS grip. beta deg.
             slip_penalty = -W_SLIP * max(0.0, self._last_beta - BETA_SLIP_DEAD)
         self._over_speed_sum += over
         if over > 0.01:

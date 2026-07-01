@@ -54,7 +54,7 @@ class TBEvalCallback(EvalCallback):
     _MEAN_KEYS = ("mean_speed", "max_arc", "over_speed_frac", "beta_mean", "beta_p90",
                   "checkpoints_reached", "r_progress", "r_match", "r_overspeed", "r_slip",
                   "r_drift", "beta_err_mean", "drift_corner_steps",  # run27 drift card
-                  "r_backward", "backward_frac",                     # run28 reverse telemetry
+                  "r_backward", "backward_frac", "straight_slip_frac",  # run28/29 reverse + straight-slip
                   "residual_abs", "residual_abs_steer", "residual_abs_throttle",
                   "residual_throttle_pos", "residual_throttle_satfrac")  # run22/24: mean |applied
                   # residual| split per channel + signed +throttle mean and +cap saturation fraction
@@ -278,7 +278,7 @@ def main():
                                                  "residual_throttle_satfrac")
     if args.drift:
         monitor_info_keys = monitor_info_keys + ("r_drift", "beta_err_mean", "drift_corner_steps",
-                                                 "r_backward", "backward_frac")
+                                                 "r_backward", "backward_frac", "straight_slip_frac")
     _train_core = make_beamng_env(
         # run17 spawn curriculum: random_spawn distributes episode starts around the
         # whole track (random idx + per-idx heading + start-speed capped at v_target),
